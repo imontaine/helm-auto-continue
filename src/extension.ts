@@ -301,12 +301,19 @@ class AutoContinue {
 
     this._settingsPanel = vscode.window.createWebviewPanel(
       'helmAutoContinueSettings',
-      'Helm Auto Continue — Settings',
+      'Helm — Antigravity Auto Continue',
       vscode.ViewColumn.One,
-      { enableScripts: true, retainContextWhenHidden: true }
+      {
+        enableScripts: true,
+        retainContextWhenHidden: true,
+        localResourceRoots: [vscode.Uri.joinPath(this._context.extensionUri, 'media')],
+      }
     );
 
-    this._settingsPanel.webview.html = this._getSettingsHtml();
+    const logoUri = this._settingsPanel.webview.asWebviewUri(
+      vscode.Uri.joinPath(this._context.extensionUri, 'media', 'helm-logo.svg')
+    );
+    this._settingsPanel.webview.html = this._getSettingsHtml(logoUri);
 
     // Handle messages from the webview
     this._settingsPanel.webview.onDidReceiveMessage(
@@ -1259,7 +1266,7 @@ class AutoContinue {
 
   // ─── Settings Webview ───────────────────────────────────────────────
 
-  private _getSettingsHtml(): string {
+  private _getSettingsHtml(logoUri: vscode.Uri): string {
     const config = vscode.workspace.getConfiguration('helmAutoContinue');
     const settings = {
       intervalSeconds: config.get<number>('intervalSeconds', 5),
@@ -1568,7 +1575,8 @@ class AutoContinue {
 </head>
 <body>
   <div class="header">
-    <h1>⚙ Helm Auto Continue</h1>
+    <img src="${logoUri}" alt="Helm" width="28" height="28" style="flex-shrink: 0;">
+    <h1>Helm — Antigravity Auto Continue</h1>
     <span class="badge">v1.20.0</span>
   </div>
 
