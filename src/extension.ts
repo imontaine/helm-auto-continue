@@ -181,9 +181,9 @@ class AutoContinue {
     this._output = vscode.window.createOutputChannel('Helm Auto Continue');
     _context.subscriptions.push(this._output);
 
-    // Main status bar button (toggle on/off)
+    // Main status bar button (opens settings)
     this._statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 97);
-    this._statusBar.command = 'helmAutoContinue.toggle';
+    this._statusBar.command = 'helmAutoContinue.openSettings';
     this._updateStatusBar();
     this._statusBar.show();
     _context.subscriptions.push(this._statusBar);
@@ -244,6 +244,7 @@ class AutoContinue {
     void vscode.commands.executeCommand('setContext', 'helmAutoContinue.isActive', true);
 
     this._startTimer();
+    this._pushRunningState();
 
     const intervalSec = this._getConfig<number>('intervalSeconds', 5);
     this._log(`Started (polling every ${intervalSec}s)`);
@@ -271,6 +272,8 @@ class AutoContinue {
     // Clear cross-extension context keys
     void vscode.commands.executeCommand('setContext', 'helmAutoContinue.isActive', false);
     void vscode.commands.executeCommand('setContext', 'helmAutoContinue.isRetrying', false);
+
+    this._pushRunningState();
 
     this._log('Stopped');
     this._logStats();
@@ -307,10 +310,12 @@ class AutoContinue {
 
     // Handle messages from the webview
     this._settingsPanel.webview.onDidReceiveMessage(
-      (msg: { type: string; key: string; value: unknown }) => {
-        if (msg.type === 'updateSetting') {
+      (msg: { type: string; key?: string; value?: unknown }) => {
+        if (msg.type === 'updateSetting' && msg.key) {
           const config = vscode.workspace.getConfiguration('helmAutoContinue');
           void config.update(msg.key, msg.value, vscode.ConfigurationTarget.Global);
+        } else if (msg.type === 'toggleMonitoring') {
+          this.toggle();
         }
       },
       undefined,
@@ -342,6 +347,14 @@ class AutoContinue {
     this._settingsPanel?.dispose();
     this._statusBar.dispose();
     this._debugBar.dispose();
+  }
+
+  /** Push the current running state to the settings webview */
+  private _pushRunningState(): void {
+    this._settingsPanel?.webview.postMessage({
+      type: 'runningState',
+      running: this._running,
+    });
   }
 
   // ─── Timer Management ──────────────────────────────────────────────────
@@ -1511,6 +1524,46 @@ class AutoContinue {
     opacity: 1;
     transform: translateY(0);
   }
+  .monitor-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 18px;
+    margin-bottom: 24px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    transition: border-color 0.2s;
+  }
+
+  .monitor-card.active {
+    border-color: var(--success);
+    background: rgba(78, 201, 176, 0.06);
+  }
+
+  .monitor-info {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .monitor-label {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-bright);
+  }
+
+  .monitor-status {
+    font-size: 12px;
+    margin-top: 2px;
+  }
+
+  .monitor-status.on {
+    color: var(--success);
+  }
+
+  .monitor-status.off {
+    color: var(--text-muted);
+  }
 </style>
 </head>
 <body>
@@ -1521,6 +1574,19 @@ class AutoContinue {
 
   <div class="promo">
     🔗 <a href="https://helm-agent.com">helm-agent.com</a> — Full AI task management for VS Code
+  </div>
+
+  <div class="monitor-card ${this._running ? 'active' : ''}" id="monitorCard">
+    <div class="monitor-info">
+      <div class="monitor-label">Monitoring</div>
+      <div class="monitor-status ${this._running ? 'on' : 'off'}" id="monitorStatus">
+        ${this._running ? '● Active — watching for errors' : '○ Stopped'}
+      </div>
+    </div>
+    <label class="toggle">
+      <input type="checkbox" id="monitorToggle" ${this._running ? 'checked' : ''}>
+      <span class="slider"></span>
+    </label>
   </div>
 
   <div class="section">
@@ -1641,6 +1707,31 @@ class AutoContinue {
       setTimeout(() => toast.classList.remove('show'), 1200);
     }
 
+    // Monitoring toggle (special — not a setting, controls start/stop)
+    const monitorToggle = document.getElementById('monitorToggle');
+    monitorToggle.addEventListener('change', () => {
+      vscode.postMessage({ type: 'toggleMonitoring' });
+    });
+
+    // Listen for state pushes from extension
+    window.addEventListener('message', (event) => {
+      const msg = event.data;
+      if (msg.type === 'runningState') {
+        const card = document.getElementById('monitorCard');
+        const status = document.getElementById('monitorStatus');
+        monitorToggle.checked = msg.running;
+        if (msg.running) {
+          card.classList.add('active');
+          status.className = 'monitor-status on';
+          status.textContent = '● Active — watching for errors';
+        } else {
+          card.classList.remove('active');
+          status.className = 'monitor-status off';
+          status.textContent = '○ Stopped';
+        }
+      }
+    });
+
     // Number inputs
     document.querySelectorAll('.num-input').forEach(el => {
       el.addEventListener('change', () => {
@@ -1657,8 +1748,8 @@ class AutoContinue {
       });
     });
 
-    // Toggles
-    document.querySelectorAll('.toggle input').forEach(el => {
+    // Toggles (settings only — exclude monitor toggle)
+    document.querySelectorAll('.toggle input:not(#monitorToggle)').forEach(el => {
       el.addEventListener('change', () => {
         save(el.id, el.checked);
       });
@@ -1731,16 +1822,16 @@ class AutoContinue {
       if (this._errorState !== 'monitoring') {
         const phase = this._errorState === 'waiting_idle' ? 'waiting' : 'cooldown';
         this._statusBar.text = `$(sync~spin) Auto Continue (${phase})`;
-        this._statusBar.tooltip = `Helm Auto Continue — ${phase}. Click to stop.`;
+        this._statusBar.tooltip = `Helm Auto Continue — ${phase}. Click for settings.`;
         this._statusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
       } else {
         this._statusBar.text = '$(eye) Auto Continue';
-        this._statusBar.tooltip = 'Helm Auto Continue is monitoring — click to stop';
+        this._statusBar.tooltip = 'Helm Auto Continue is monitoring — click for settings';
         this._statusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.prominentBackground');
       }
     } else {
       this._statusBar.text = '$(eye-closed) Auto Continue';
-      this._statusBar.tooltip = 'Helm Auto Continue is off — click to start';
+      this._statusBar.tooltip = 'Helm Auto Continue is off — click for settings';
       this._statusBar.backgroundColor = undefined;
     }
   }
