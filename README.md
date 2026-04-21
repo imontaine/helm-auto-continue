@@ -195,6 +195,12 @@ No capacity available, MODEL_CAPACITY_EXHAUSTED
 
 ## Changelog
 
+### 1.20.0 — Settings-First UX
+
+- **Status bar opens settings panel** — clicking `Auto Continue` in the status bar now opens the settings webview instead of toggling on/off.
+- **Monitoring toggle** — on/off control is now the first item in the settings panel with live state sync (green active card, grey stopped).
+- Toggle/start/stop commands remain available via Command Palette.
+
 ### 1.19.0 — Settings Panel
 
 - **Settings webview panel** — open via Command Palette → `Helm Auto Continue: Settings`. Provides a clean dark UI with toggle switches, number inputs, dropdown, and text input for all 8 settings. Changes save instantly.

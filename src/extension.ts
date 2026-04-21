@@ -1569,7 +1569,7 @@ class AutoContinue {
 <body>
   <div class="header">
     <h1>⚙ Helm Auto Continue</h1>
-    <span class="badge">v1.19.0</span>
+    <span class="badge">v1.20.0</span>
   </div>
 
   <div class="promo">
