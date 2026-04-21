@@ -439,7 +439,7 @@ class AutoContinue {
         } else {
           this._errorState = 'cooldown';
           this._cooldownStartedAt = Date.now();
-          const cooldownMs = this._getConfig<number>('postSendCooldownMs', 15000);
+          const cooldownMs = this._getConfig<number>('postSendCooldownMs', 5000);
           this._log(`  Agent is idle — starting ${Math.round(cooldownMs / 1000)}s cooldown`);
         }
 
@@ -454,7 +454,7 @@ class AutoContinue {
         if (!isBusy) {
           this._errorState = 'cooldown';
           this._cooldownStartedAt = Date.now();
-          const cooldownMs = this._getConfig<number>('postSendCooldownMs', 15000);
+          const cooldownMs = this._getConfig<number>('postSendCooldownMs', 5000);
           this._log(`  Agent went idle — starting ${Math.round(cooldownMs / 1000)}s cooldown`);
           this._updateDebugBar();
         } else {
@@ -465,7 +465,7 @@ class AutoContinue {
 
       // ─── COOLDOWN: agent idle, waiting timer before sending Continue ──
       case 'cooldown': {
-        const cooldownMs = this._getConfig<number>('postSendCooldownMs', 15000);
+        const cooldownMs = this._getConfig<number>('postSendCooldownMs', 5000);
         const elapsed = Date.now() - this._cooldownStartedAt;
 
         if (elapsed >= cooldownMs) {
@@ -1268,8 +1268,8 @@ class AutoContinue {
       focusProbe: config.get<boolean>('focusProbe', false),
       continuePrompt: config.get<string>('continuePrompt', 'Continue'),
       diagnosticsFrequency: config.get<number>('diagnosticsFrequency', 1),
-      postSendCooldownMs: config.get<number>('postSendCooldownMs', 15000),
-      logLevel: config.get<string>('logLevel', 'normal'),
+      postSendCooldownMs: config.get<number>('postSendCooldownMs', 5000),
+      logLevel: config.get<string>('logLevel', 'minimal'),
     };
 
     return `<!DOCTYPE html>
@@ -1773,7 +1773,7 @@ class AutoContinue {
   }
 
   private _getLogLevel(): LogLevel {
-    return this._getConfig<LogLevel>('logLevel', 'normal');
+    return this._getConfig<LogLevel>('logLevel', 'minimal');
   }
 
   /**

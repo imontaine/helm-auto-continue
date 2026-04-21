@@ -96,13 +96,13 @@
         },
         "helmAutoContinue.postSendCooldownMs": {
           "type": "number",
-          "default": 15000,
+          "default": 5000,
           "minimum": 0,
-          "description": "Milliseconds to wait after the agent goes idle before sending Continue. This gives the system time to stabilize and avoids sending Continue while the agent is still processing. Default 15s = 3 poll cycles at 5s intervals."
+          "description": "Milliseconds to wait after the agent goes idle before sending Continue. This gives the system time to stabilize and avoids sending Continue while the agent is still processing. Default 5s = 1 poll cycle at 5s intervals."
         },
         "helmAutoContinue.logLevel": {
           "type": "string",
-          "default": "normal",
+          "default": "minimal",
           "enum": ["minimal", "normal", "verbose"],
           "enumDescriptions": [
             "Events only — errors, recoveries, continues. Zero output on quiet polls.",
