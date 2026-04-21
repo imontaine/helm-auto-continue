@@ -1,16 +1,20 @@
-# Helm — Auto Continue
+# Helm — Antigravity Auto Continue
 
-A lightweight VS Code extension that automatically detects chat API errors (503, rate limits, capacity exhaustion) and sends a configurable prompt to resume the AI agent — so you never have to babysit a stalled conversation.
+A lightweight Antigravity extension that automatically detects chat API errors (503, rate limits, capacity exhaustion) and sends a configurable prompt to resume the AI agent — so you never have to babysit a stalled conversation.
 
 ---
 
 ## The Problem
 
-When using AI coding assistants in VS Code (Antigravity, Copilot Chat, etc.), the underlying model APIs occasionally fail mid-response with transient errors:
+When using Antigravity, the underlying model APIs occasionally fail mid-response with transient errors:
 
 - **HTTP 503** — service temporarily unavailable
 - **MODEL_CAPACITY_EXHAUSTED** — the model is overloaded
 - **Rate limiting** — too many requests in a short window
+- **High traffic** — servers are experiencing high traffic, try again in a minute
+- **Agent terminated** — agent terminated due to error
+- **Retry prompt** — you can prompt the model to try again or start a new conversation
+- **HTTP 503 Service Unavailable** — raw status code response
 
 When this happens, the agent stops and the conversation hangs. You have to manually notice the failure, type "Continue", and wait. If it happens at 2 AM while you're AFK, your agent is dead in the water until you come back.
 
@@ -18,25 +22,19 @@ When this happens, the agent stops and the conversation hangs. You have to manua
 
 **Helm Auto Continue** monitors for chat errors using multiple detection strategies and automatically sends a configurable prompt to resume the agent. It uses exponential backoff to space retries intelligently and includes safety rails to prevent infinite retry loops.
 
+## Limitations
+
+**This extension is not intended to replace auto-all extensions.** There are many auto-all extensions; this is intended to work alongside those extensions by recovering from errors that they may not be able to recover from.
+
 ---
 
+## Getting Started
+
+### How to use the extension
+
+After you install the extension, you will see two buttons on the bottom of Antigravity — one is the toggle button and the other is the log button. The toggle button will start and stop the extension; the log button will open the output channel.
+
 ## How It Works
-
-### Error Detection
-
-The extension uses **five strategies** to detect errors, in priority order:
-
-| # | Strategy | How It Works | Reliability | Requires Focus? |
-|---|---|---|---|---|
-| **S0** | **Diagnostics log parsing** | Calls `antigravity.getDiagnostics`, parses `agentWindowConsoleLogs` and `languageServerLogs` for error patterns (503, rate limit, capacity). Also monitors trajectory step index for stalls. | ⭐⭐⭐⭐ | No |
-| **S1** | **Context key** | Reads `chatSessionResponseError` via `getContext` command | ⭐⭐⭐ | Yes — response element must be in focus chain |
-| **S2** | **Focus probe** | Focuses the chat panel, navigates to last response element, reads context keys, restores focus | ⭐⭐ | Self-focusing (causes flicker) |
-| **S3** | **Idle timeout** | Tracks `chatSessionRequestInProgress` and triggers when agent has been idle too long after being active | ⭐⭐⭐ | Depends on S0/S1 busy signal |
-| **S4** | **Manual trigger** | User runs `Report Chat Error` from Command Palette | ⭐⭐⭐⭐⭐ | No |
-
-> **Primary strategy:** S0 (diagnostics log parsing) is the most reliable because it requires no focus management and detects errors from log content. S1–S3 provide supplementary detection. S4 is the guaranteed fallback.
-
-> **Why so many strategies?** The `chatSessionResponseError` context key is **scoped** to the chat response widget element in the VS Code DOM, not the global context. It's only readable when the response element is in the focus chain. S0 bypasses this limitation entirely by parsing raw log data.
 
 ### Error Response State Machine
 
@@ -78,7 +76,7 @@ Uses a **self-scheduling `setTimeout` loop** instead of `setInterval`. The next 
 
 ### Cooldown
 
-After detecting an error, the extension waits for the agent to go idle, then waits a configurable cooldown period (default 15s) before sending "Continue". This ensures the system has fully stabilized before issuing a new prompt.
+After detecting an error, the extension waits for the agent to go idle, then waits a configurable cooldown period (default 5s) before sending "Continue". This ensures the system has fully stabilized before issuing a new prompt.
 
 ### Diagnostic Capture
 
@@ -158,11 +156,11 @@ All settings under `helmAutoContinue.*`:
 | `intervalSeconds` | number | `5` | Polling interval (seconds). Min: 3. |
 | `startOnActivation` | boolean | `true` | Auto-start when VS Code launches. |
 | `continuePrompt` | string | `"Continue"` | The message sent to the chat panel. |
-| `postSendCooldownMs` | number | `15000` | Cooldown (ms) after agent goes idle before sending Continue. |
+| `postSendCooldownMs` | number | `5000` | Cooldown (ms) after agent goes idle before sending Continue. |
 | `diagnosticsFrequency` | number | `1` | Run getDiagnostics log parsing every Nth poll tick. Higher = less overhead but slower detection. |
 | `idleTimeoutSeconds` | number | `0` | Seconds of inactivity after being busy before triggering. 0 = disabled (recommended). |
 | `focusProbe` | boolean | `false` | Briefly focus chat panel to read context keys. Disabled by default (causes flickering). |
-| `logLevel` | string | `"normal"` | `minimal` (events only), `normal` (+ one-line poll summaries), `verbose` (full per-strategy diagnostics). |
+| `logLevel` | string | `"minimal"` | `minimal` (events only), `normal` (+ one-line poll summaries), `verbose` (full per-strategy diagnostics). |
 
 ---
 
@@ -178,7 +176,7 @@ All settings under `helmAutoContinue.*`:
 
 ---
 
-## Error Patterns
+## Antigravity Error Patterns
 
 The diagnostics log scanner matches these patterns (case-insensitive):
 
@@ -190,159 +188,6 @@ server error, internal server error, high traffic,
 try again in, please try again, experiencing high,
 No capacity available, MODEL_CAPACITY_EXHAUSTED
 ```
-
----
-
-## Changelog
-
-### 1.20.0 — Settings-First UX
-
-- **Status bar opens settings panel** — clicking `Auto Continue` in the status bar now opens the settings webview instead of toggling on/off.
-- **Monitoring toggle** — on/off control is now the first item in the settings panel with live state sync (green active card, grey stopped).
-- Toggle/start/stop commands remain available via Command Palette.
-
-### 1.19.0 — Settings Panel
-
-- **Settings webview panel** — open via Command Palette → `Helm Auto Continue: Settings`. Provides a clean dark UI with toggle switches, number inputs, dropdown, and text input for all 8 settings. Changes save instantly.
-- **Log level descriptions updated** — `normal` enum description now accurately reflects the silent-during-healthy-polls behavior.
-
-### 1.18.0 — Log Cleanup
-
-- **Default log level changed to `normal`** — was `verbose` (both in code and manifest). Normal shows one-line poll summaries (~2 lines/tick). Verbose remains available for debugging.
-- **Promotional banner moved to click-to-view** — the periodic `Visit helm-agent.com` message no longer injects into the log stream every 20 lines. Instead, a clean branded banner appears once when the user clicks the debug status bar button to open the output channel.
-- **Removed `_logLineCount` tracking** — no longer needed since the ad is no longer periodic.
-
-### 1.17.0 — Simplified Error Recovery
-
-**Architecture: 3-state machine replaces retry/backoff system.** The entire error response pipeline was replaced with a clean state machine:
-
-```
-MONITORING → error detected → WAITING_IDLE (if busy) or COOLDOWN (if idle)
-WAITING_IDLE → agent goes idle → COOLDOWN
-COOLDOWN → postSendCooldownMs expires → send "Continue" → MONITORING
-(repeat forever — no limits)
-```
-
-The previous system used exponential backoff (`retryDelayMs × 2^retries`, capped at `maxBackoffMs`), a max retry limit (`maxRetries`, default 30), a recovery detection mechanism (agent busy >10s = recovered → reset counter), and a post-send cooldown to prevent false recovery declarations. All of this has been removed in favor of a simpler invariant: **wait for !busy, wait cooldown, send, repeat**.
-
-**Removed class fields:**
-- `_consecutiveRetries` — retry counter (no longer needed, retries are unlimited)
-- `_lastRetrySentAt` — timestamp for backoff calculation
-- `_recoveryCooldownUntil` — post-send recovery window
-- `_capturedThisSession` → renamed to `_capturedThisCycle` (resets per error cycle, not per session)
-- `_stats.recoveries` — recovery counter removed from `SessionStats`
-
-**New class fields:**
-- `_errorState: 'monitoring' | 'waiting_idle' | 'cooldown'` — current phase of the state machine
-- `_cooldownStartedAt: number` — when the cooldown timer started
-
-**Removed settings** (from `package.json` configuration):
-- `helmAutoContinue.maxRetries` — no longer applicable (retries are unlimited)
-- `helmAutoContinue.retryDelayMs` — no longer applicable (no backoff)
-- `helmAutoContinue.maxBackoffMs` — no longer applicable (no backoff)
-
-**Repurposed `postSendCooldownMs`** — Previously acted as a post-send window to prevent false recovery. Now acts as the pre-send cooldown: the wait time after the agent goes idle before sending Continue. Same default (15s), different role.
-
-**Status bar changes:**
-- Main button: `$(sync~spin) Auto Continue (N)` → `$(sync~spin) Auto Continue (waiting|cooldown)` — shows current phase instead of retry count
-- Debug bar: removed `Recovered` and `Retries` lines from tooltip, added `Phase` line showing error state
-- Debug bar background: `WAIT_IDLE` and `COOLDOWN` states now show error (red) background
-
-**`_tick()` reduced from ~180 to ~90 lines** — the entire method is now a switch statement over three states with no nested conditionals for backoff, recovery detection, or cooldown reset guards.
-
-**Bug fix: stale `_consecutiveRetries` reference** — The focus probe's `shouldRestore` logic (`_probeForError`) still referenced `this._consecutiveRetries === 0` to decide whether to restore editor focus. Fixed to use `this._errorState === 'monitoring'`.
-
-### 1.16.0
-
-- **Fixed broken error detection** — The `getDiagnostics` payload evolved: `mainThreadLogs` changed from a flat string/array to a nested object (`{ cloudcode: string[], auth: string[], 'ls-main': string[] }`). The old `_extractLogEntries` merged all sub-fields into one flat array under a single tracking key, making incremental index tracking unreliable when sub-field ordering changed between calls. Rewrote log extraction to produce separate tracked sources per leaf (e.g., `mainThreadLogs.ls-main`) so each source has its own stable index. Also handles `rendererLogs` which uses the same nested format. `agentWindowConsoleLogs` is now NULL in the payload — all errors appear in `mainThreadLogs.ls-main`.
-
-### 1.15.1
-
-- **Fixed cooldown killing busy recovery** — The v1.15.0 cooldown reset ran unconditionally on every error tick, including when the agent was busy recovering. Because the cooldown was freshly set in the same tick, the busy recovery check (`Date.now() < _recoveryCooldownUntil`) was always true — making the entire ERROR+BUSY recovery path dead code. The extension would never declare recovery and keep retrying until maxRetries. Fix: only reset cooldown when agent is idle (`!isBusy`).
-- **Fixed `idleTimeoutSeconds` code fallback** — Code default was `45` but manifest default is `0` (disabled). Aligned code fallback to `0` to match.
-
-### 1.15.0
-
-- **Fixed false recovery race condition** — cooldown timer now resets every time an error is detected during a retry cycle. Recovery can only be declared after `postSendCooldownMs` of *consecutive clean* ticks, preventing the case where S0 consumes a re-error (advancing log indices) and then falsely declares recovery once the original cooldown expires.
-- **IDLE status bar cleanup** — shows just `IDLE` with default background instead of `IDLE(Ns)` in gold. Seconds remain visible in hover tooltip and verbose logs.
-- **Output channel ad** — periodic `Visit helm-agent.com` message every 20 log lines.
-
-### 1.14.0
-
-- **Fixed `focusProbe` code default** — now correctly defaults to `false` (matching manifest)
-- **Fixed `_trackIdleState` not called on every tick** — S1 now tracks busy state even when no error is detected
-- **Fixed `errorsDetected` undercounting** — errors during ERROR+BUSY recovery are now counted
-- **Fixed IDLE state debug bar color** — IDLE no longer shows warning (yellow) background
-
-### 1.13.0
-
-- **Three-tier log levels** — `minimal`, `normal`, `verbose` replaces verbose boolean. Normal mode shows one-line poll summaries.
-
-### 1.12.0
-
-- **Post-send recovery cooldown** — prevents false recovery when agent 503s immediately after processing Continue.
-
-### 1.11.0
-
-- **Session-aware trajectory** — stale conversations from previous sessions don't trigger stall detection.
-- **Diagnostic capture** — full getDiagnostics payload saved to `.helm-diag/` on first error per cycle.
-
-### 1.10.0
-
-- **Cold-start guard** — idle timeout only fires after agent activity has been observed (`_everSeenBusy` flag).
-- **First-scan snapshot** — log indices initialized to current lengths on startup, preventing false positives from historical logs.
-
-### 1.9.0
-
-- **Trajectory stall detection** — monitors `recentTrajectories[0].lastStepIndex` for frozen step counters.
-- **`diagnosticsFrequency` setting** — configurable polling frequency for getDiagnostics.
-
-### 1.8.0
-
-- **Idle timeout refinements** — `_busyStart` tracking for sustained busy duration.
-
-### 1.7.0
-
-- **Idle timeout strategy** — monitors `chatSessionRequestInProgress` transitions.
-
-### 1.6.0
-
-- **Focus restoration improvements** — skip restoration when output channel has focus.
-
-### 1.5.0
-
-- **Focus probe with 4 sub-strategies** — tries multiple focus commands to bring context keys into scope.
-
-### 1.4.0
-
-- **getDiagnostics error detection** — Strategy 0 added. Parses `agentWindowConsoleLogs` and `languageServerLogs` for error patterns.
-
-### 1.3.0
-
-- **Debug status bar** — second status bar item showing current detection state.
-- **Session statistics** — tracks polls, errors, continues, recoveries.
-
-### 1.2.0
-
-- **Exponential backoff** — `retryDelayMs × 2^retries` with configurable ceiling.
-- **Sustained recovery detection** — agent must be busy >10s before declaring recovery.
-
-### 1.1.0
-
-- **Manual error trigger** — New `Report Chat Error` command for guaranteed fallback
-- **Configurable continue prompt** — `continuePrompt` setting
-- **Fixed timer overlap** — `setTimeout` loop replaces `setInterval`
-- **Config change listener** — `intervalSeconds` changes take effect immediately
-- **Debounced notifications** — Only after 2+ retries
-- **Cross-extension context keys** — `helmAutoContinue.isActive` and `.isRetrying`
-- **Removed keyboard shortcut** — Status bar is the primary toggle
-- **Documented context key scoping** — Explained why detection requires chat focus
-
-### 1.0.0
-
-- Initial release
-
----
 
 ## License
 
