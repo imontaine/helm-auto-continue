@@ -100,8 +100,6 @@ class AutoContinue {
   private _debugBar: vscode.StatusBarItem;
   private _running = false;
 
-
-
   /** Timestamp when monitoring started — used for cold-start detection */
   private _monitoringStartedAt = 0;
 
@@ -214,10 +212,6 @@ class AutoContinue {
     if (autoStart) {
       this.start();
     }
-  }
-
-  get isRunning(): boolean {
-    return this._running;
   }
 
   start(): void {
@@ -467,6 +461,7 @@ class AutoContinue {
    * Detect chat error AND agent busy state.
    *
    * Detection strategies (in priority order):
+   *   0. getDiagnostics log parsing — most reliable, no focus needed
    *   1. Context key — fast path when chat response element is already focused
    *   2. Focus probe — focuses chat, navigates to last response, reads keys
    *   3. Idle timeout — triggers when agent is idle too long after being busy
