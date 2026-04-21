@@ -1,0 +1,123 @@
+{
+  "name": "helm-auto-continue",
+  "displayName": "Helm — Auto Continue",
+  "description": "Automatically detects chat API errors (503, rate limits, capacity exhaustion) and sends 'Continue' to resume the AI agent.",
+  "version": "1.18.0",
+  "license": "MIT",
+  "publisher": "antigravity",
+  "icon": "media/icon-120.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "helmAutoContinue.toggle",
+        "title": "Helm Auto Continue: Toggle"
+      },
+      {
+        "command": "helmAutoContinue.start",
+        "title": "Helm Auto Continue: Start"
+      },
+      {
+        "command": "helmAutoContinue.stop",
+        "title": "Helm Auto Continue: Stop"
+      },
+      {
+        "command": "helmAutoContinue.showLog",
+        "title": "Helm Auto Continue: Show Log"
+      },
+      {
+        "command": "helmAutoContinue.reportError",
+        "title": "Helm Auto Continue: Report Chat Error",
+        "icon": "$(warning)"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        { "command": "helmAutoContinue.toggle" },
+        { "command": "helmAutoContinue.start" },
+        { "command": "helmAutoContinue.stop" },
+        { "command": "helmAutoContinue.showLog" },
+        { "command": "helmAutoContinue.reportError" }
+      ]
+    },
+    "configuration": {
+      "title": "Helm Auto Continue",
+      "properties": {
+        "helmAutoContinue.intervalSeconds": {
+          "type": "number",
+          "default": 5,
+          "minimum": 3,
+          "description": "How often (in seconds) to check for chat API errors."
+        },
+        "helmAutoContinue.idleTimeoutSeconds": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Seconds of agent inactivity after being busy before triggering auto-continue. Set to 0 to disable (recommended — diagnostics log scanning is more reliable). When enabled, monitors chatSessionRequestInProgress and triggers when the agent goes idle. Cannot distinguish 'finished' from 'errored', so may cause false positives after completed tasks."
+        },
+        "helmAutoContinue.startOnActivation": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start monitoring when the extension activates."
+        },
+        "helmAutoContinue.focusProbe": {
+          "type": "boolean",
+          "default": false,
+          "description": "Briefly focus the chat panel on each poll tick to read scoped error context keys, then restore editor focus. Disabled by default because it causes visible chat panel flickering. Only enable if diagnostics-based detection is unavailable and you need context-key error detection."
+        },
+        "helmAutoContinue.continuePrompt": {
+          "type": "string",
+          "default": "Continue",
+          "description": "The message sent to the chat panel when an error is detected. Change this if your AI provider expects a different recovery prompt."
+        },
+        "helmAutoContinue.diagnosticsFrequency": {
+          "type": "number",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 20,
+          "description": "Run getDiagnostics log parsing every Nth poll tick. Default 1 (every poll) for fastest detection. Higher values reduce overhead but increase detection latency."
+        },
+        "helmAutoContinue.postSendCooldownMs": {
+          "type": "number",
+          "default": 15000,
+          "minimum": 0,
+          "description": "Milliseconds to wait after the agent goes idle before sending Continue. This gives the system time to stabilize and avoids sending Continue while the agent is still processing. Default 15s = 3 poll cycles at 5s intervals."
+        },
+        "helmAutoContinue.logLevel": {
+          "type": "string",
+          "default": "normal",
+          "enum": ["minimal", "normal", "verbose"],
+          "enumDescriptions": [
+            "Events only — errors, recoveries, continues. Zero output on quiet polls.",
+            "Events + one-line poll summary each tick (~1-2 lines/5s).",
+            "Full per-strategy diagnostics on every tick (~15 lines/5s). Use for debugging."
+          ],
+          "description": "Controls how much detail appears in the Helm Auto Continue output channel."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.js",
+    "build:watch": "node esbuild.js --watch",
+    "vscode:prepublish": "node esbuild.js --production",
+    "package": "npx -y @vscode/vsce package --no-dependencies --allow-missing-repository"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.3"
+  }
+}

@@ -1,0 +1,11 @@
+src/**
+node_modules/**
+tsconfig.json
+esbuild.js
+.gitignore
+*.vsix
+**/*.map
+package-lock.json
+research.md
+scratch_*.ps1
+.helm-diag/**
