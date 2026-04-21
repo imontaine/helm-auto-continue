@@ -40,6 +40,11 @@
         "command": "helmAutoContinue.reportError",
         "title": "Helm Auto Continue: Report Chat Error",
         "icon": "$(warning)"
+      },
+      {
+        "command": "helmAutoContinue.openSettings",
+        "title": "Helm Auto Continue: Settings",
+        "icon": "$(gear)"
       }
     ],
     "menus": {
@@ -48,7 +53,8 @@
         { "command": "helmAutoContinue.start" },
         { "command": "helmAutoContinue.stop" },
         { "command": "helmAutoContinue.showLog" },
-        { "command": "helmAutoContinue.reportError" }
+        { "command": "helmAutoContinue.reportError" },
+        { "command": "helmAutoContinue.openSettings" }
       ]
     },
     "configuration": {
@@ -100,7 +106,7 @@
           "enum": ["minimal", "normal", "verbose"],
           "enumDescriptions": [
             "Events only — errors, recoveries, continues. Zero output on quiet polls.",
-            "Events + one-line poll summary each tick (~1-2 lines/5s).",
+            "State changes, startup info, and dispatch method. Silent during healthy polls.",
             "Full per-strategy diagnostics on every tick (~15 lines/5s). Use for debugging."
           ],
           "description": "Controls how much detail appears in the Helm Auto Continue output channel."

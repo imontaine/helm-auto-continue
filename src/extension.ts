@@ -112,6 +112,9 @@ class AutoContinue {
   /** Output channel for logging */
   private _output: vscode.OutputChannel;
 
+  /** Settings webview panel */
+  private _settingsPanel: vscode.WebviewPanel | undefined;
+
   /** Whether context keys are available (null = unknown) */
   private _contextKeysAvailable: boolean | null = null;
 
@@ -287,6 +290,38 @@ class AutoContinue {
     this._output.show(true);
   }
 
+  openSettings(): void {
+    if (this._settingsPanel) {
+      this._settingsPanel.reveal();
+      return;
+    }
+
+    this._settingsPanel = vscode.window.createWebviewPanel(
+      'helmAutoContinueSettings',
+      'Helm Auto Continue — Settings',
+      vscode.ViewColumn.One,
+      { enableScripts: true, retainContextWhenHidden: true }
+    );
+
+    this._settingsPanel.webview.html = this._getSettingsHtml();
+
+    // Handle messages from the webview
+    this._settingsPanel.webview.onDidReceiveMessage(
+      (msg: { type: string; key: string; value: unknown }) => {
+        if (msg.type === 'updateSetting') {
+          const config = vscode.workspace.getConfiguration('helmAutoContinue');
+          void config.update(msg.key, msg.value, vscode.ConfigurationTarget.Global);
+        }
+      },
+      undefined,
+      this._context.subscriptions
+    );
+
+    this._settingsPanel.onDidDispose(() => {
+      this._settingsPanel = undefined;
+    });
+  }
+
   /**
    * Manually report a chat error.
    */
@@ -304,6 +339,7 @@ class AutoContinue {
 
   dispose(): void {
     this.stop();
+    this._settingsPanel?.dispose();
     this._statusBar.dispose();
     this._debugBar.dispose();
   }
@@ -1208,6 +1244,437 @@ class AutoContinue {
     );
   }
 
+  // ─── Settings Webview ───────────────────────────────────────────────
+
+  private _getSettingsHtml(): string {
+    const config = vscode.workspace.getConfiguration('helmAutoContinue');
+    const settings = {
+      intervalSeconds: config.get<number>('intervalSeconds', 5),
+      idleTimeoutSeconds: config.get<number>('idleTimeoutSeconds', 0),
+      startOnActivation: config.get<boolean>('startOnActivation', true),
+      focusProbe: config.get<boolean>('focusProbe', false),
+      continuePrompt: config.get<string>('continuePrompt', 'Continue'),
+      diagnosticsFrequency: config.get<number>('diagnosticsFrequency', 1),
+      postSendCooldownMs: config.get<number>('postSendCooldownMs', 15000),
+      logLevel: config.get<string>('logLevel', 'normal'),
+    };
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Helm Auto Continue Settings</title>
+<style>
+  :root {
+    --bg: #1e1e1e;
+    --surface: #252526;
+    --surface-hover: #2a2d2e;
+    --border: #3c3c3c;
+    --text: #cccccc;
+    --text-muted: #888888;
+    --text-bright: #e0e0e0;
+    --accent: #0078d4;
+    --accent-hover: #1a8fe8;
+    --accent-dim: rgba(0, 120, 212, 0.15);
+    --danger: #f14c4c;
+    --success: #4ec9b0;
+    --input-bg: #3c3c3c;
+    --input-border: #555555;
+    --radius: 6px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 13px;
+    color: var(--text);
+    background: var(--bg);
+    padding: 24px;
+    line-height: 1.5;
+  }
+
+  .header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 8px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .header h1 {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-bright);
+    letter-spacing: -0.3px;
+  }
+
+  .header .badge {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: var(--accent-dim);
+    color: var(--accent);
+    font-weight: 500;
+  }
+
+  .promo {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    margin: 16px 0 24px;
+    background: var(--accent-dim);
+    border: 1px solid rgba(0, 120, 212, 0.3);
+    border-radius: var(--radius);
+    font-size: 12px;
+    color: var(--accent-hover);
+  }
+
+  .promo a {
+    color: var(--accent-hover);
+    text-decoration: none;
+    font-weight: 600;
+  }
+
+  .promo a:hover { text-decoration: underline; }
+
+  .section {
+    margin-bottom: 28px;
+  }
+
+  .section-title {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-muted);
+    margin-bottom: 12px;
+  }
+
+  .setting {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    padding: 14px 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    margin-bottom: 8px;
+    transition: border-color 0.15s;
+  }
+
+  .setting:hover {
+    border-color: var(--input-border);
+  }
+
+  .setting-info { flex: 1; margin-right: 20px; }
+
+  .setting-label {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-bright);
+    margin-bottom: 3px;
+  }
+
+  .setting-desc {
+    font-size: 12px;
+    color: var(--text-muted);
+    line-height: 1.4;
+  }
+
+  .setting-control {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    padding-top: 2px;
+  }
+
+  /* Toggle switch */
+  .toggle {
+    position: relative;
+    width: 40px;
+    height: 22px;
+    cursor: pointer;
+  }
+
+  .toggle input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+  }
+
+  .toggle .slider {
+    position: absolute;
+    inset: 0;
+    background: var(--input-bg);
+    border-radius: 11px;
+    transition: background 0.2s;
+  }
+
+  .toggle .slider::before {
+    content: '';
+    position: absolute;
+    width: 16px;
+    height: 16px;
+    left: 3px;
+    bottom: 3px;
+    background: var(--text-muted);
+    border-radius: 50%;
+    transition: transform 0.2s, background 0.2s;
+  }
+
+  .toggle input:checked + .slider {
+    background: var(--accent);
+  }
+
+  .toggle input:checked + .slider::before {
+    transform: translateX(18px);
+    background: #fff;
+  }
+
+  /* Number input */
+  .num-input {
+    width: 80px;
+    padding: 5px 8px;
+    background: var(--input-bg);
+    border: 1px solid var(--input-border);
+    border-radius: 4px;
+    color: var(--text-bright);
+    font-size: 13px;
+    text-align: center;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+  .num-input:focus {
+    border-color: var(--accent);
+  }
+
+  /* Text input */
+  .text-input {
+    width: 160px;
+    padding: 5px 10px;
+    background: var(--input-bg);
+    border: 1px solid var(--input-border);
+    border-radius: 4px;
+    color: var(--text-bright);
+    font-size: 13px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+  .text-input:focus {
+    border-color: var(--accent);
+  }
+
+  /* Select dropdown */
+  .select {
+    padding: 5px 28px 5px 10px;
+    background: var(--input-bg);
+    border: 1px solid var(--input-border);
+    border-radius: 4px;
+    color: var(--text-bright);
+    font-size: 13px;
+    outline: none;
+    appearance: none;
+    cursor: pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23888'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+    transition: border-color 0.15s;
+  }
+
+  .select:focus {
+    border-color: var(--accent);
+  }
+
+  .saved-toast {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    background: var(--success);
+    color: #1e1e1e;
+    padding: 8px 16px;
+    border-radius: var(--radius);
+    font-size: 12px;
+    font-weight: 600;
+    opacity: 0;
+    transform: translateY(10px);
+    transition: opacity 0.2s, transform 0.2s;
+    pointer-events: none;
+  }
+
+  .saved-toast.show {
+    opacity: 1;
+    transform: translateY(0);
+  }
+</style>
+</head>
+<body>
+  <div class="header">
+    <h1>⚙ Helm Auto Continue</h1>
+    <span class="badge">v1.18.0</span>
+  </div>
+
+  <div class="promo">
+    🔗 <a href="https://helm-agent.com">helm-agent.com</a> — Full AI task management for VS Code
+  </div>
+
+  <div class="section">
+    <div class="section-title">Core</div>
+
+    <div class="setting">
+      <div class="setting-info">
+        <div class="setting-label">Poll Interval</div>
+        <div class="setting-desc">How often to check for chat API errors (seconds).</div>
+      </div>
+      <div class="setting-control">
+        <input type="number" class="num-input" id="intervalSeconds" min="3" value="${settings.intervalSeconds}">
+      </div>
+    </div>
+
+    <div class="setting">
+      <div class="setting-info">
+        <div class="setting-label">Continue Prompt</div>
+        <div class="setting-desc">The message sent to resume the AI agent after an error.</div>
+      </div>
+      <div class="setting-control">
+        <input type="text" class="text-input" id="continuePrompt" value="${settings.continuePrompt}">
+      </div>
+    </div>
+
+    <div class="setting">
+      <div class="setting-info">
+        <div class="setting-label">Auto Start</div>
+        <div class="setting-desc">Start monitoring automatically when VS Code opens.</div>
+      </div>
+      <div class="setting-control">
+        <label class="toggle">
+          <input type="checkbox" id="startOnActivation" ${settings.startOnActivation ? 'checked' : ''}>
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Timing</div>
+
+    <div class="setting">
+      <div class="setting-info">
+        <div class="setting-label">Post-Send Cooldown</div>
+        <div class="setting-desc">Wait time (ms) after agent goes idle before sending Continue. Prevents premature retries.</div>
+      </div>
+      <div class="setting-control">
+        <input type="number" class="num-input" id="postSendCooldownMs" min="0" step="1000" value="${settings.postSendCooldownMs}">
+      </div>
+    </div>
+
+    <div class="setting">
+      <div class="setting-info">
+        <div class="setting-label">Idle Timeout</div>
+        <div class="setting-desc">Seconds of inactivity to trigger recovery. 0 = disabled (recommended).</div>
+      </div>
+      <div class="setting-control">
+        <input type="number" class="num-input" id="idleTimeoutSeconds" min="0" value="${settings.idleTimeoutSeconds}">
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Detection</div>
+
+    <div class="setting">
+      <div class="setting-info">
+        <div class="setting-label">Diagnostics Frequency</div>
+        <div class="setting-desc">Run log parsing every Nth poll. Lower = faster detection, higher = less overhead.</div>
+      </div>
+      <div class="setting-control">
+        <input type="number" class="num-input" id="diagnosticsFrequency" min="1" max="20" value="${settings.diagnosticsFrequency}">
+      </div>
+    </div>
+
+    <div class="setting">
+      <div class="setting-info">
+        <div class="setting-label">Focus Probe</div>
+        <div class="setting-desc">Briefly focus chat panel to read error keys. Causes flickering — off by default.</div>
+      </div>
+      <div class="setting-control">
+        <label class="toggle">
+          <input type="checkbox" id="focusProbe" ${settings.focusProbe ? 'checked' : ''}>
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Logging</div>
+
+    <div class="setting">
+      <div class="setting-info">
+        <div class="setting-label">Log Level</div>
+        <div class="setting-desc">Controls output channel verbosity. Normal is silent during healthy polls.</div>
+      </div>
+      <div class="setting-control">
+        <select class="select" id="logLevel">
+          <option value="minimal" ${settings.logLevel === 'minimal' ? 'selected' : ''}>Minimal</option>
+          <option value="normal" ${settings.logLevel === 'normal' ? 'selected' : ''}>Normal</option>
+          <option value="verbose" ${settings.logLevel === 'verbose' ? 'selected' : ''}>Verbose</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
+  <div class="saved-toast" id="toast">✓ Saved</div>
+
+  <script>
+    const vscode = acquireVsCodeApi();
+
+    function save(key, value) {
+      vscode.postMessage({ type: 'updateSetting', key, value });
+      const toast = document.getElementById('toast');
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 1200);
+    }
+
+    // Number inputs
+    document.querySelectorAll('.num-input').forEach(el => {
+      el.addEventListener('change', () => {
+        save(el.id, Number(el.value));
+      });
+    });
+
+    // Text inputs
+    document.querySelectorAll('.text-input').forEach(el => {
+      let timer;
+      el.addEventListener('input', () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => save(el.id, el.value), 500);
+      });
+    });
+
+    // Toggles
+    document.querySelectorAll('.toggle input').forEach(el => {
+      el.addEventListener('change', () => {
+        save(el.id, el.checked);
+      });
+    });
+
+    // Selects
+    document.querySelectorAll('.select').forEach(el => {
+      el.addEventListener('change', () => {
+        save(el.id, el.value);
+      });
+    });
+  </script>
+</body>
+</html>`;
+  }
+
   // ─── Helpers ─────────────────────────────────────────────────────────
 
   private _getConfig<T>(key: string, defaultValue: T): T {
@@ -1326,6 +1793,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('helmAutoContinue.stop', () => autoContinue?.stop()),
     vscode.commands.registerCommand('helmAutoContinue.showLog', () => autoContinue?.showLog()),
     vscode.commands.registerCommand('helmAutoContinue.reportError', () => autoContinue?.reportError()),
+    vscode.commands.registerCommand('helmAutoContinue.openSettings', () => autoContinue?.openSettings()),
   );
 }
 
