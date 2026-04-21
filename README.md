@@ -195,6 +195,11 @@ No capacity available, MODEL_CAPACITY_EXHAUSTED
 
 ## Changelog
 
+### 1.19.0 — Settings Panel
+
+- **Settings webview panel** — open via Command Palette → `Helm Auto Continue: Settings`. Provides a clean dark UI with toggle switches, number inputs, dropdown, and text input for all 8 settings. Changes save instantly.
+- **Log level descriptions updated** — `normal` enum description now accurately reflects the silent-during-healthy-polls behavior.
+
 ### 1.18.0 — Log Cleanup
 
 - **Default log level changed to `normal`** — was `verbose` (both in code and manifest). Normal shows one-line poll summaries (~2 lines/tick). Verbose remains available for debugging.

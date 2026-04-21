@@ -2,7 +2,7 @@
   "name": "helm-auto-continue",
   "displayName": "Helm — Auto Continue",
   "description": "Automatically detects chat API errors (503, rate limits, capacity exhaustion) and sends 'Continue' to resume the AI agent.",
-  "version": "1.18.0",
+  "version": "1.19.0",
   "license": "MIT",
   "publisher": "antigravity",
   "icon": "media/icon-120.png",
