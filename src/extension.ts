@@ -356,16 +356,13 @@ class AutoContinue {
 
     this._stats.lastState = stateLabel;
 
-    // Log poll summary — compact at normal, full at verbose, silent at minimal
+    // Log poll summary — full at verbose, silent at normal/minimal
     if (level === 'verbose') {
       this._log(
         `Poll #${this._stats.totalPolls}: error=${hasError} busy=${isBusy} → ${stateLabel} (phase=${this._errorState})`
       );
-    } else if (level === 'normal') {
-      const src = result.source ? ` [${result.source}]` : '';
-      this._log(`#${this._stats.totalPolls} ${stateLabel}${src}`);
     }
-    // minimal: no poll line at all
+    // normal/minimal: no per-tick line — only state changes are logged
 
     this._updateDebugBar();
 
@@ -787,7 +784,7 @@ class AutoContinue {
     try {
       await vscode.commands.executeCommand('getContext', 'chatSessionResponseError');
       this._contextKeysAvailable = true;
-      this._log('Context key API available (view-level keys readable when chat is focused; response-level keys require response element focus)');
+      this._logAt('normal', 'Context key API available');
     } catch {
       this._contextKeysAvailable = false;
       this._log('⚠ Context key API not available — will rely on diagnostics, idle timeout, and manual reporting');
@@ -836,7 +833,7 @@ class AutoContinue {
       const parsed = this._parseDiagnosticsResult(raw);
       if (parsed) {
         this._diagnosticsAvailable = true;
-        const trajectoryCount = parsed.recentTrajectories?.length ?? 0;
+        const trajectoryCount = (parsed.recentTrajectories as any[])?.length ?? 0;
         // Initialize log indices to current lengths so we only scan NEW entries
         const allSources = this._extractAllLogSources(parsed);
         for (const [name, entries] of allSources) {
@@ -845,10 +842,7 @@ class AutoContinue {
             lastEntry: entries.length > 0 ? entries[entries.length - 1] : '',
           };
         }
-        const sourceNames = allSources.map(([n, e]) => `${n}(${e.length})`).join(', ');
-        const payloadType = typeof raw === 'string' ? 'string' : 'object';
-        const sizeEstimate = typeof raw === 'string' ? Math.round(raw.length / 1024) : Math.round(JSON.stringify(raw).length / 1024);
-        this._log(`✓ getDiagnostics available (${sizeEstimate}KB ${payloadType} payload, ${trajectoryCount} trajectories, sources: ${sourceNames})`);
+        this._logAt('normal', `✓ getDiagnostics available (${trajectoryCount} trajectories, ${allSources.length} log sources)`);
       } else {
         this._diagnosticsAvailable = false;
         this._log('⚠ getDiagnostics returned empty/invalid — strategy 0 disabled');
@@ -1159,8 +1153,8 @@ class AutoContinue {
       fs.writeFileSync(filePath, content, 'utf-8');
 
       const sizeKB = Math.round(fs.statSync(filePath).size / 1024);
-      this._log(`  [capture] ★ Diagnostics captured: ${filename} (${sizeKB}KB)`);
-      this._log(`  [capture]   Path: ${filePath}`);
+      this._logAt('normal', `  [capture] ★ Diagnostics captured: ${filename} (${sizeKB}KB)`);
+      this._logAt('verbose', `  [capture]   Path: ${filePath}`);
     } catch (e: any) {
       this._log(`  [capture] Failed to capture diagnostics: ${e.message ?? 'unknown'}`);
     }
@@ -1180,7 +1174,7 @@ class AutoContinue {
     // Strategy 1: Antigravity native API
     try {
       await vscode.commands.executeCommand('antigravity.sendPromptToAgentPanel', prompt);
-      this._log('  → Sent via antigravity.sendPromptToAgentPanel');
+      this._logAt('normal', '  → Sent via antigravity.sendPromptToAgentPanel');
       return;
     } catch {
       // Not available — fall through
@@ -1192,7 +1186,7 @@ class AutoContinue {
         query: prompt,
         isPartialQuery: false,
       });
-      this._log('  → Sent via workbench.action.chat.open');
+      this._logAt('normal', '  → Sent via workbench.action.chat.open');
       return;
     } catch {
       // Not available — fall through
@@ -1207,7 +1201,7 @@ class AutoContinue {
         await vscode.commands.executeCommand('antigravity.openChatView');
       } catch { /* ignore */ }
     }
-    this._log('  → Clipboard fallback — prompt copied');
+    this._logAt('normal', '  → Clipboard fallback — prompt copied');
     vscode.window.showWarningMessage(
       'Helm Auto Continue: Prompt copied to clipboard — paste (Ctrl+V) in the chat.',
       'Dismiss'
