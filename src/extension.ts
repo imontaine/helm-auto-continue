@@ -70,26 +70,36 @@ interface ProbeResult {
   source?: string;
 }
 
-// Error patterns to match in diagnostics logs
-const DIAG_ERROR_PATTERNS = [
-  /\b503\b/i,
-  /rate.?limit/i,
-  /capacity.?exhaust/i,
-  /model.?capacity/i,
-  /overloaded/i,
-  /too.?many.?requests/i,
-  /service.?unavailable/i,
-  /quota.?exceeded/i,
-  /temporarily.?unavailable/i,
-  /RESOURCE_EXHAUSTED/i,
-  /server.?error/i,
-  /internal.?server.?error/i,
-  /high.?traffic/i,
-  /try.?again.?in/i,
-  /please.?try.?again/i,
-  /experiencing.?high/i,
-  /No capacity available/i,
-  /MODEL_CAPACITY_EXHAUSTED/,
+// Default error patterns — trigger auto-continue (configurable via settings)
+const DEFAULT_ERROR_PATTERNS = [
+  '\\b503\\b',
+  'rate.?limit',
+  'capacity.?exhaust',
+  'model.?capacity',
+  'overloaded',
+  'too.?many.?requests',
+  'service.?unavailable',
+  'quota.?exceeded',
+  'temporarily.?unavailable',
+  'RESOURCE_EXHAUSTED',
+  'server.?error',
+  'internal.?server.?error',
+  'high.?traffic',
+  'try.?again.?in',
+  'please.?try.?again',
+  'experiencing.?high',
+  'No capacity available',
+  'MODEL_CAPACITY_EXHAUSTED',
+];
+
+// Default suppress patterns — non-retryable, stop monitoring (configurable via settings)
+const DEFAULT_SUPPRESS_PATTERNS = [
+  'insufficient.?ai.?credits',
+  'insufficient.?credits',
+  'no.?credits.?remaining',
+  'billing.?required',
+  'payment.?required',
+  'subscription.?expired',
 ];
 
 // ─── AutoContinue ─────────────────────────────────────────────────────────
@@ -446,7 +456,7 @@ class AutoContinue {
         } else {
           this._errorState = 'cooldown';
           this._cooldownStartedAt = Date.now();
-          const cooldownMs = this._getConfig<number>('postSendCooldownMs', 5000);
+          const cooldownMs = this._getConfig<number>('postSendCooldownMs', 10000);
           this._log(`  Agent is idle — starting ${Math.round(cooldownMs / 1000)}s cooldown`);
         }
 
@@ -461,7 +471,7 @@ class AutoContinue {
         if (!isBusy) {
           this._errorState = 'cooldown';
           this._cooldownStartedAt = Date.now();
-          const cooldownMs = this._getConfig<number>('postSendCooldownMs', 5000);
+          const cooldownMs = this._getConfig<number>('postSendCooldownMs', 10000);
           this._log(`  Agent went idle — starting ${Math.round(cooldownMs / 1000)}s cooldown`);
           this._updateDebugBar();
         } else {
@@ -472,7 +482,7 @@ class AutoContinue {
 
       // ─── COOLDOWN: agent idle, waiting timer before sending Continue ──
       case 'cooldown': {
-        const cooldownMs = this._getConfig<number>('postSendCooldownMs', 5000);
+        const cooldownMs = this._getConfig<number>('postSendCooldownMs', 10000);
         const elapsed = Date.now() - this._cooldownStartedAt;
 
         if (elapsed >= cooldownMs) {
@@ -526,6 +536,18 @@ class AutoContinue {
   private async _detectState(): Promise<ProbeResult> {
     const level = this._getLogLevel();
 
+    // ─── Recovery Timeout Gate ──────────────────────────────────────────
+    const recoveryTimeoutSec = this._getConfig<number>('recoveryTimeoutSeconds', 300);
+    if (recoveryTimeoutSec > 0 && this._idleSince) {
+      const idleDuration = (Date.now() - this._idleSince) / 1000;
+      if (idleDuration >= recoveryTimeoutSec) {
+        if (level === 'verbose') {
+          this._log(`  [recovery-timeout] Agent idle for ${Math.round(idleDuration)}s (threshold: ${recoveryTimeoutSec}s) — suppressing error detection`);
+        }
+        return { hasError: false, isBusy: false };
+      }
+    }
+
     // Strategy 0: getDiagnostics log parsing (most reliable, no focus needed)
     const diagFrequency = this._getConfig<number>('diagnosticsFrequency', 1);
     this._diagPollCounter++;
@@ -541,8 +563,14 @@ class AutoContinue {
       }
       this._trackIdleState(diagResult.isBusy);
       if (diagResult.hasError) {
-        this._log(`  [detect] ★ Diagnostics: error found via ${diagResult.source}`);
-        return diagResult;
+        // Window Scope Recovery: require this window's agent was recently active
+        const windowScope = this._getConfig<boolean>('windowScopeRecovery', true);
+        if (windowScope && !this._everSeenBusy) {
+          this._logAt('normal', `  [S0:diag] Error suppressed by Window Scope Recovery — agent never active in this window`);
+        } else {
+          this._log(`  [detect] ★ Diagnostics: error found via ${diagResult.source}`);
+          return diagResult;
+        }
       }
     }
 
@@ -1090,7 +1118,29 @@ class AutoContinue {
           }
 
           const combinedNew = newEntries.join('\n');
-          for (const pattern of DIAG_ERROR_PATTERNS) {
+
+          // Compile patterns from user config
+          const suppressPatterns = this._compilePatterns(
+            this._getConfig<string[]>('suppressPatterns', DEFAULT_SUPPRESS_PATTERNS)
+          );
+          const errorPatterns = this._compilePatterns(
+            this._getConfig<string[]>('errorPatterns', DEFAULT_ERROR_PATTERNS)
+          );
+
+          // Check suppression patterns first — non-retryable errors
+          for (const pattern of suppressPatterns) {
+            const match = combinedNew.match(pattern);
+            if (match) {
+              this._log(`  [diag] ⛔ ${sourceName} NON-RETRYABLE: "${match[0]}" — suppressing Continue`);
+              vscode.window.showWarningMessage(
+                `Helm Auto Continue: Non-retryable error detected ("${match[0]}"). Auto-continue paused.`
+              );
+              this.stop();
+              return { hasError: false, isBusy: false };
+            }
+          }
+
+          for (const pattern of errorPatterns) {
             const match = combinedNew.match(pattern);
             if (match) {
               this._log(`  [diag] ★ ${sourceName} error: "${match[0]}" in ${newEntries.length} new entries`);
@@ -1275,8 +1325,12 @@ class AutoContinue {
       focusProbe: config.get<boolean>('focusProbe', false),
       continuePrompt: config.get<string>('continuePrompt', 'Continue'),
       diagnosticsFrequency: config.get<number>('diagnosticsFrequency', 1),
-      postSendCooldownMs: config.get<number>('postSendCooldownMs', 5000),
+      postSendCooldownMs: config.get<number>('postSendCooldownMs', 10000),
       logLevel: config.get<string>('logLevel', 'minimal'),
+      windowScopeRecovery: config.get<boolean>('windowScopeRecovery', true),
+      recoveryTimeoutSeconds: config.get<number>('recoveryTimeoutSeconds', 300),
+      errorPatterns: config.get<string[]>('errorPatterns', DEFAULT_ERROR_PATTERNS),
+      suppressPatterns: config.get<string[]>('suppressPatterns', DEFAULT_SUPPRESS_PATTERNS),
     };
 
     return `<!DOCTYPE html>
@@ -1571,13 +1625,33 @@ class AutoContinue {
   .monitor-status.off {
     color: var(--text-muted);
   }
+
+  .pattern-input {
+    width: 100%;
+    min-height: 120px;
+    padding: 10px;
+    background: var(--input-bg);
+    border: 1px solid var(--input-border);
+    border-radius: 4px;
+    color: var(--text-bright);
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+    font-size: 12px;
+    line-height: 1.6;
+    resize: vertical;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+  .pattern-input:focus {
+    border-color: var(--accent);
+  }
 </style>
 </head>
 <body>
   <div class="header">
     <img src="${logoUri}" alt="Helm" width="28" height="28" style="flex-shrink: 0;">
     <h1>Helm — Antigravity Auto Continue</h1>
-    <span class="badge">v1.20.0</span>
+    <span class="badge">v1.21.0</span>
   </div>
 
   <div class="promo">
@@ -1632,6 +1706,19 @@ class AutoContinue {
         </label>
       </div>
     </div>
+
+    <div class="setting">
+      <div class="setting-info">
+        <div class="setting-label">Window Scope Recovery</div>
+        <div class="setting-desc">Only fire Continue if this window's agent was recently active. Prevents cross-window false positives when multiple VS Code windows are open.</div>
+      </div>
+      <div class="setting-control">
+        <label class="toggle">
+          <input type="checkbox" id="windowScopeRecovery" ${settings.windowScopeRecovery ? 'checked' : ''}>
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
   </div>
 
   <div class="section">
@@ -1654,6 +1741,16 @@ class AutoContinue {
       </div>
       <div class="setting-control">
         <input type="number" class="num-input" id="idleTimeoutSeconds" min="0" value="${settings.idleTimeoutSeconds}">
+      </div>
+    </div>
+
+    <div class="setting">
+      <div class="setting-info">
+        <div class="setting-label">Recovery Timeout</div>
+        <div class="setting-desc">Don't fire Continue if the agent has been idle longer than this (seconds). Prevents stale errors from triggering recovery in inactive windows. 0 = disabled.</div>
+      </div>
+      <div class="setting-control">
+        <input type="number" class="num-input" id="recoveryTimeoutSeconds" min="0" value="${settings.recoveryTimeoutSeconds}">
       </div>
     </div>
   </div>
@@ -1682,6 +1779,26 @@ class AutoContinue {
           <span class="slider"></span>
         </label>
       </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Patterns</div>
+
+    <div class="setting" style="flex-direction: column; align-items: stretch;">
+      <div class="setting-info" style="margin-bottom: 8px;">
+        <div class="setting-label">Error Patterns (trigger Continue)</div>
+        <div class="setting-desc">Regex patterns (case-insensitive). One per line. When matched in new log entries, triggers auto-continue.</div>
+      </div>
+      <textarea class="pattern-input" id="errorPatterns">${settings.errorPatterns.join('\n')}</textarea>
+    </div>
+
+    <div class="setting" style="flex-direction: column; align-items: stretch;">
+      <div class="setting-info" style="margin-bottom: 8px;">
+        <div class="setting-label">Suppress Patterns (stop monitoring)</div>
+        <div class="setting-desc">Regex patterns (case-insensitive). One per line. Non-retryable errors — stops monitoring entirely when matched.</div>
+      </div>
+      <textarea class="pattern-input" id="suppressPatterns">${settings.suppressPatterns.join('\n')}</textarea>
     </div>
   </div>
 
@@ -1769,6 +1886,18 @@ class AutoContinue {
         save(el.id, el.value);
       });
     });
+
+    // Pattern textareas
+    document.querySelectorAll('.pattern-input').forEach(el => {
+      let timer;
+      el.addEventListener('input', () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          const lines = el.value.split('\n').filter(l => l.trim().length > 0);
+          save(el.id, lines);
+        }, 800);
+      });
+    });
   </script>
 </body>
 </html>`;
@@ -1782,6 +1911,16 @@ class AutoContinue {
 
   private _getLogLevel(): LogLevel {
     return this._getConfig<LogLevel>('logLevel', 'minimal');
+  }
+
+  /**
+   * Compile an array of pattern strings into RegExp objects.
+   * Invalid patterns are silently skipped.
+   */
+  private _compilePatterns(patterns: string[]): RegExp[] {
+    return patterns
+      .map(p => { try { return new RegExp(p, 'i'); } catch { return null; } })
+      .filter((r): r is RegExp => r !== null);
   }
 
   /**

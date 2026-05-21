@@ -20,7 +20,7 @@ When this happens, the agent stops and the conversation hangs. You have to manua
 
 ## The Solution
 
-**Helm Auto Continue** monitors for chat errors using multiple detection strategies and automatically sends a configurable prompt to resume the agent. It uses exponential backoff to space retries intelligently and includes safety rails to prevent infinite retry loops.
+**Helm Auto Continue** monitors for chat errors using multiple detection strategies and automatically sends a configurable prompt to resume the agent. It includes safety rails for multi-window environments and non-retryable error detection to prevent wasted retries.
 
 ## Limitations
 
@@ -60,6 +60,18 @@ Once an error is detected, the extension follows a simple 3-state machine:
 └─ Repeat forever — no retry limit, no backoff
 ```
 
+### Multi-Window Isolation (v1.21.0)
+
+When multiple VS Code windows are open, each running its own workspace, the underlying Antigravity backend shares a single diagnostics log pool across all windows. A 503 error in Window A would previously trigger auto-continue in **both** windows.
+
+**Window Scope Recovery** (enabled by default) solves this by requiring that the agent in a given window was actually observed as busy before allowing error recovery to fire. If Window B's agent was never active, it won't react to errors that belong to Window A.
+
+**Recovery Timeout** adds a second safeguard: if the agent has been idle for longer than a configurable threshold (default 300 seconds), error detection is suppressed entirely. This prevents stale windows from firing on old errors.
+
+### Non-Retryable Error Suppression (v1.21.0)
+
+Some errors — like "Insufficient AI Credits" — are not transient. Retrying won't help. When the extension detects a non-retryable error in the logs, it **stops monitoring entirely** and shows a warning notification. This prevents wasted continue attempts when the real fix requires user action (e.g., adding credits).
+
 ### Chat Dispatch Strategy
 
 The extension delivers the continue prompt using a three-tier fallback:
@@ -76,7 +88,7 @@ Uses a **self-scheduling `setTimeout` loop** instead of `setInterval`. The next 
 
 ### Cooldown
 
-After detecting an error, the extension waits for the agent to go idle, then waits a configurable cooldown period (default 5s) before sending "Continue". This ensures the system has fully stabilized before issuing a new prompt.
+After detecting an error, the extension waits for the agent to go idle, then waits a configurable cooldown period (default 10s) before sending "Continue". This ensures the system has fully stabilized before issuing a new prompt.
 
 ### Diagnostic Capture
 
@@ -137,6 +149,7 @@ npm run package
 | `Helm Auto Continue: Stop` | Stop monitoring |
 | `Helm Auto Continue: Show Log` | Open the output channel |
 | `Helm Auto Continue: Report Chat Error` | Manually trigger error recovery |
+| `Helm Auto Continue: Settings` | Open the settings panel |
 
 ### Quick Start
 
@@ -151,24 +164,78 @@ npm run package
 
 All settings under `helmAutoContinue.*`:
 
+### Core
+
 | Setting | Type | Default | Description |
 |---|---|---|---|
 | `intervalSeconds` | number | `5` | Polling interval (seconds). Min: 3. |
-| `startOnActivation` | boolean | `true` | Auto-start when VS Code launches. |
 | `continuePrompt` | string | `"Continue"` | The message sent to the chat panel. |
-| `postSendCooldownMs` | number | `5000` | Cooldown (ms) after agent goes idle before sending Continue. |
-| `diagnosticsFrequency` | number | `1` | Run getDiagnostics log parsing every Nth poll tick. Higher = less overhead but slower detection. |
+| `startOnActivation` | boolean | `true` | Auto-start when VS Code launches. |
+| `windowScopeRecovery` | boolean | `true` | Only fire Continue if this window's agent was recently active. Prevents cross-window false positives. |
+
+### Timing
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `postSendCooldownMs` | number | `10000` | Cooldown (ms) after agent goes idle before sending Continue. |
 | `idleTimeoutSeconds` | number | `0` | Seconds of inactivity after being busy before triggering. 0 = disabled (recommended). |
+| `recoveryTimeoutSeconds` | number | `300` | Don't fire Continue if the agent has been idle longer than this (seconds). 0 = disabled. |
+
+### Detection
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `diagnosticsFrequency` | number | `1` | Run getDiagnostics log parsing every Nth poll tick. Higher = less overhead but slower detection. |
 | `focusProbe` | boolean | `false` | Briefly focus chat panel to read context keys. Disabled by default (causes flickering). |
-| `logLevel` | string | `"minimal"` | `minimal` (events only), `normal` (+ one-line poll summaries), `verbose` (full per-strategy diagnostics). |
+
+### Patterns
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `errorPatterns` | string[] | *(see below)* | Regex patterns (case-insensitive) that trigger auto-continue. |
+| `suppressPatterns` | string[] | *(see below)* | Regex patterns (case-insensitive) for non-retryable errors that stop monitoring. |
+
+### Logging
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `logLevel` | string | `"minimal"` | `minimal` (events only), `normal` (+ state changes), `verbose` (full per-strategy diagnostics). |
+
+---
+
+## Error Patterns (trigger Continue)
+
+These patterns are matched (case-insensitive) against new log entries. When matched, auto-continue fires. Editable via settings.
+
+```
+\b503\b, rate limit, capacity exhaust, model capacity,
+overloaded, too many requests, service unavailable,
+quota exceeded, temporarily unavailable, RESOURCE_EXHAUSTED,
+server error, internal server error, high traffic,
+try again in, please try again, experiencing high,
+No capacity available, MODEL_CAPACITY_EXHAUSTED
+```
+
+## Suppress Patterns (stop monitoring)
+
+These patterns match non-retryable errors. When detected, monitoring **stops entirely** and a warning notification is shown. Editable via settings.
+
+```
+insufficient ai credits, insufficient credits,
+no credits remaining, billing required,
+payment required, subscription expired
+```
 
 ---
 
 ## Safety Rails
 
+- **Window Scope Recovery** — Only fires if this window's agent was recently active (prevents cross-window leaking)
+- **Recovery Timeout** — Suppresses recovery after extended idle periods (default 300s)
+- **Non-retryable suppression** — Stops monitoring on billing/credit errors instead of retrying forever
 - **Wait-for-idle** — Never sends Continue while the agent is actively processing
 - **Cooldown timer** — Waits `postSendCooldownMs` after agent goes idle before sending
-- **Unlimited retries** — Keeps retrying as long as errors occur (no retry limit)
+- **Unlimited retries** — Keeps retrying as long as transient errors occur (no retry limit)
 - **Cold-start guard** — Idle timeout only fires after agent activity has been observed
 - **Session-aware trajectory** — Stale conversations from previous sessions don't trigger false stalls
 - **Sequential timer** — `setTimeout` loop prevents overlapping ticks
@@ -176,18 +243,15 @@ All settings under `helmAutoContinue.*`:
 
 ---
 
-## Antigravity Error Patterns
+## Changelog
 
-The diagnostics log scanner matches these patterns (case-insensitive):
+### v1.21.0
 
-```
-503, rate limit, capacity exhaust, model capacity,
-overloaded, too many requests, service unavailable,
-quota exceeded, temporarily unavailable, RESOURCE_EXHAUSTED,
-server error, internal server error, high traffic,
-try again in, please try again, experiencing high,
-No capacity available, MODEL_CAPACITY_EXHAUSTED
-```
+- **Window Scope Recovery** — New toggle (default ON) that prevents cross-window error leaking when multiple VS Code windows share the same Antigravity backend
+- **Recovery Timeout** — New setting (default 300s) that suppresses error detection when the agent has been idle too long
+- **Non-retryable error suppression** — Detects "Insufficient AI Credits" and similar billing errors, stops monitoring instead of retrying
+- **Editable patterns** — Error patterns and suppress patterns are now configurable string arrays editable via the settings panel or `settings.json`
+- **Post-send cooldown** — Default increased from 5s to 10s for more reliable recovery
 
 ## License
 

@@ -2,7 +2,7 @@
   "name": "helm-auto-continue",
   "displayName": "Helm — Antigravity Auto Continue",
   "description": "Automatically detects chat API errors (503, rate limits, capacity exhaustion) and sends 'Continue' to resume the AI agent.",
-  "version": "1.20.0",
+  "version": "1.21.0",
   "license": "MIT",
   "publisher": "imontaine",
   "icon": "media/icon-120.png",
@@ -96,9 +96,9 @@
         },
         "helmAutoContinue.postSendCooldownMs": {
           "type": "number",
-          "default": 5000,
+          "default": 10000,
           "minimum": 0,
-          "description": "Milliseconds to wait after the agent goes idle before sending Continue. This gives the system time to stabilize and avoids sending Continue while the agent is still processing. Default 5s = 1 poll cycle at 5s intervals."
+          "description": "Milliseconds to wait after the agent goes idle before sending Continue. This gives the system time to stabilize and avoids sending Continue while the agent is still processing. Default 10s = 2 poll cycles at 5s intervals."
         },
         "helmAutoContinue.logLevel": {
           "type": "string",
@@ -110,6 +110,55 @@
             "Full per-strategy diagnostics on every tick (~15 lines/5s). Use for debugging."
           ],
           "description": "Controls how much detail appears in the Helm Auto Continue output channel."
+        },
+        "helmAutoContinue.windowScopeRecovery": {
+          "type": "boolean",
+          "default": true,
+          "description": "When enabled, requires that this window's agent was recently active before firing Continue. Prevents cross-window false positives when multiple VS Code windows share the same Antigravity backend — a 503 in Window A won't trigger Continue in Window B if Window B's agent was never busy."
+        },
+        "helmAutoContinue.recoveryTimeoutSeconds": {
+          "type": "number",
+          "default": 300,
+          "minimum": 0,
+          "description": "If the agent in this window has been idle for longer than this many seconds, don't fire Continue even if an error is detected in global logs. Prevents stale error detections from triggering recovery in inactive windows. 0 = disabled."
+        },
+        "helmAutoContinue.errorPatterns": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [
+            "\\b503\\b",
+            "rate.?limit",
+            "capacity.?exhaust",
+            "model.?capacity",
+            "overloaded",
+            "too.?many.?requests",
+            "service.?unavailable",
+            "quota.?exceeded",
+            "temporarily.?unavailable",
+            "RESOURCE_EXHAUSTED",
+            "server.?error",
+            "internal.?server.?error",
+            "high.?traffic",
+            "try.?again.?in",
+            "please.?try.?again",
+            "experiencing.?high",
+            "No capacity available",
+            "MODEL_CAPACITY_EXHAUSTED"
+          ],
+          "description": "Regex patterns (case-insensitive) that trigger auto-continue when matched in new log entries. One pattern per entry."
+        },
+        "helmAutoContinue.suppressPatterns": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [
+            "insufficient.?ai.?credits",
+            "insufficient.?credits",
+            "no.?credits.?remaining",
+            "billing.?required",
+            "payment.?required",
+            "subscription.?expired"
+          ],
+          "description": "Regex patterns (case-insensitive) for non-retryable errors. When matched, monitoring stops entirely — retrying would be pointless."
         }
       }
     }
