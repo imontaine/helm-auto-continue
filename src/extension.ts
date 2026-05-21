@@ -1651,7 +1651,7 @@ class AutoContinue {
   <div class="header">
     <img src="${logoUri}" alt="Helm" width="28" height="28" style="flex-shrink: 0;">
     <h1>Helm — Antigravity Auto Continue</h1>
-    <span class="badge">v1.21.0</span>
+    <span class="badge">v1.21.1</span>
   </div>
 
   <div class="promo">
