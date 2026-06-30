@@ -144,19 +144,53 @@ npm run package
 
 | Command | Description |
 |---|---|
-| `Helm Auto Continue: Toggle` | Start or stop monitoring |
-| `Helm Auto Continue: Start` | Start monitoring |
-| `Helm Auto Continue: Stop` | Stop monitoring |
-| `Helm Auto Continue: Show Log` | Open the output channel |
-| `Helm Auto Continue: Report Chat Error` | Manually trigger error recovery |
-| `Helm Auto Continue: Settings` | Open the settings panel |
+| `Antigravity Recovery Auto Continue: Toggle` | Start or stop monitoring |
+| `Antigravity Recovery Auto Continue: Start` | Start monitoring |
+| `Antigravity Recovery Auto Continue: Stop` | Stop monitoring |
+| `Antigravity Recovery Auto Continue: Show Log` | Open the output channel |
+| `Antigravity Recovery Auto Continue: Report Chat Error` | Manually trigger error recovery |
+| `Antigravity Recovery Auto Continue: Settings` | Open the settings panel |
+| `Antigravity Recovery Auto Continue: Run Full Test` | Run the complete test pipeline (mark active + simulate error) |
+| `Antigravity Recovery Auto Continue: Simulate Error (Test)` | Queue a synthetic 503 error for the next poll |
+| `Antigravity Recovery Auto Continue: Mark Window Active (Test)` | Bypass window scope recovery for testing |
 
 ### Quick Start
 
 1. Install the extension — it starts monitoring automatically
 2. Start your AI agent
 3. If it hits a transient error, auto-continue detects it via log parsing and triggers automatically
-4. If detection fails for any reason, run `Helm Auto Continue: Report Chat Error` (Ctrl+Shift+P) to trigger recovery manually
+4. If detection fails for any reason, run `Antigravity Recovery Auto Continue: Report Chat Error` (Ctrl+Shift+P) to trigger recovery manually
+
+---
+
+## Developer Tools
+
+Three test commands are available from the Command Palette (`Ctrl+Shift+P`) to exercise the error recovery pipeline without waiting for a real API failure.
+
+### Run Full Test (recommended)
+
+1. Open the Command Palette (`Ctrl+Shift+P`)
+2. Search for **"Antigravity Recovery Auto Continue: Run Full Test"**
+3. The command will:
+   - Auto-start monitoring if it's stopped
+   - Mark the window as active (bypasses Window Scope Recovery)
+   - Queue a synthetic 503 error
+4. Watch the pipeline trace in the Output channel (`Antigravity Recovery Auto Continue: Show Log`)
+5. Expected flow: `detect error → COOLDOWN → send Continue`
+
+### Individual Test Commands
+
+| Command | What it does |
+|---|---|
+| **Mark Window Active (Test)** | Sets `_everSeenBusy = true` so Window Scope Recovery doesn't suppress errors. Run this first if testing individual commands in a fresh window. |
+| **Simulate Error (Test)** | Queues a synthetic "503 error" that fires on the next diagnostics poll. Triggers the full detect → cooldown → send pipeline. |
+
+### Testing Tips
+
+- Set `logLevel` to `verbose` before testing to see full per-strategy diagnostics
+- Set `postSendCooldownMs` to `1000` (1s) for faster test cycles
+- Open the output channel **before** running the test to watch the pipeline in real-time
+- The settings webview panel also shows a live test console if open during the test
 
 ---
 

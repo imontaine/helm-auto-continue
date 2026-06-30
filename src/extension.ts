@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as http from 'http';
+import { exec } from 'child_process';
 
 /**
  * AutoContinue: a toggleable timer that monitors for chat API errors
@@ -66,8 +68,21 @@ interface SessionStats {
 
 interface ProbeResult {
   hasError: boolean;
+  /** True if the agent is actively processing RIGHT NOW on this poll. */
   isBusy: boolean;
+  /**
+   * True if the agent was active within the configured busy window.
+   * Used by WAITING_IDLE — broader than isBusy, covers in-progress
+   * tool calls where the step index hasn't ticked yet.
+   */
+  isRecent: boolean;
   source?: string;
+}
+
+/** Circular step-index history entry */
+interface StepEntry {
+  ts: number;   // Date.now() when observed
+  step: number; // lastStepIndex value
 }
 
 // Default error patterns — trigger auto-continue (configurable via settings)
@@ -125,6 +140,9 @@ class AutoContinue {
   /** Settings webview panel */
   private _settingsPanel: vscode.WebviewPanel | undefined;
 
+  /** Whether a test run is active — enables live log pushes to webview */
+  private _testRunActive = false;
+
   /** Whether context keys are available (null = unknown) */
   private _contextKeysAvailable: boolean | null = null;
 
@@ -138,11 +156,21 @@ class AutoContinue {
    *  circular buffers where old entries drop and length stays constant. */
   private _lastLogState: Record<string, { length: number; lastEntry: string }> = {};
 
-  /** Last known step index for the active conversation */
-  private _lastKnownStepIndex: number | null = null;
+  /**
+   * Circular buffer of the last N observed (timestamp, stepIndex) pairs.
+   * Used to determine both "changed this poll" (isBusy) and "changed
+   * recently" (isRecent) without relying on lastModifiedTime at all.
+   */
+  private _stepHistory: StepEntry[] = [];
+  private static readonly STEP_HISTORY_SIZE = 8;
 
-  /** Timestamp when step index last changed */
-  private _stepIndexLastChanged: number | null = null;
+  /**
+   * Trajectory ID (googleAgentId) that we've bound to for this window.
+   * Bound on the FIRST step-index change that comes from a trajectory
+   * modified after this window's monitoring session started.
+   * Once set, only this specific trajectory is used for busy/stall detection.
+   */
+  private _boundTrajectoryId: string | null = null;
 
   /** How often to call getDiagnostics (expensive — every N polls) */
   private _diagPollCounter = 0;
@@ -176,6 +204,9 @@ class AutoContinue {
   /** Whether we've already captured diagnostics for the current error cycle */
   private _capturedThisCycle = false;
 
+  /** When set, _checkDiagnostics returns a synthetic error on the next call. */
+  private _simulatedErrorPending = false;
+
   // ────────────────────────────────────────────────────────────────────────
 
   /** Session statistics */
@@ -187,8 +218,11 @@ class AutoContinue {
     startedAt: null,
   };
 
+  /** CDP Auto Clicker — independent DOM-injection subsystem */
+  private _cdpAutoClicker!: CdpAutoClicker;
+
   constructor(private readonly _context: vscode.ExtensionContext) {
-    this._output = vscode.window.createOutputChannel('Helm Auto Continue');
+    this._output = vscode.window.createOutputChannel('Antigravity Recovery Auto Continue');
     _context.subscriptions.push(this._output);
 
     // Main status bar button (opens settings)
@@ -220,7 +254,17 @@ class AutoContinue {
     void this._checkContextKeyAvailability();
     void this._checkDiagnosticsAvailability();
 
-    // Auto-start if configured
+    // CDP Auto Clicker — instantiate and optionally auto-start
+    this._cdpAutoClicker = new CdpAutoClicker(
+      _context,
+      (msg) => this._log(msg)
+    );
+    _context.subscriptions.push({ dispose: () => this._cdpAutoClicker.dispose() });
+    if (this._getConfig<boolean>('cdpAutoClick', false)) {
+      this._cdpAutoClicker.start();
+    }
+
+    // Auto-start error-recovery monitor if configured
     const autoStart = this._getConfig<boolean>('startOnActivation', true);
     if (autoStart) {
       this.start();
@@ -240,10 +284,10 @@ class AutoContinue {
     // working before idle timeout can fire. This prevents false
     // positives when monitoring starts with no active agent.
     this._busyStart = null;
+    this._boundTrajectoryId = null;
     this._monitoringStartedAt = Date.now();
     this._lastLogState = {};
-    this._lastKnownStepIndex = null;
-    this._stepIndexLastChanged = null;
+    this._stepHistory = [];
     this._diagPollCounter = 0;
     this._capturedThisCycle = false;
     this._stats.startedAt = Date.now();
@@ -259,7 +303,7 @@ class AutoContinue {
     const intervalSec = this._getConfig<number>('intervalSeconds', 5);
     this._log(`Started (polling every ${intervalSec}s)`);
     vscode.window.showInformationMessage(
-      `Helm Auto Continue started (checking every ${intervalSec}s)`
+      `Antigravity Recovery Auto Continue started (checking every ${intervalSec}s)`
     );
   }
 
@@ -275,6 +319,7 @@ class AutoContinue {
     this._idleSince = null;
     this._busyStart = null;
     this._manualErrorFlag = false;
+    this._simulatedErrorPending = false;
     this._capturedThisCycle = false;
     this._updateStatusBar();
     this._updateDebugBar();
@@ -287,7 +332,7 @@ class AutoContinue {
 
     this._log('Stopped');
     this._logStats();
-    vscode.window.showInformationMessage('Helm Auto Continue stopped');
+    vscode.window.showInformationMessage('Antigravity Recovery Auto Continue stopped');
   }
 
   toggle(): void {
@@ -295,11 +340,6 @@ class AutoContinue {
   }
 
   showLog(): void {
-    this._output.appendLine('');
-    this._output.appendLine('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    this._output.appendLine('  🔗  helm-agent.com — Full AI task management for VS Code');
-    this._output.appendLine('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    this._output.appendLine('');
     this._output.show(true);
   }
 
@@ -311,7 +351,7 @@ class AutoContinue {
 
     this._settingsPanel = vscode.window.createWebviewPanel(
       'helmAutoContinueSettings',
-      'Helm — Antigravity Auto Continue',
+      'Antigravity Recovery Auto Continue',
       vscode.ViewColumn.One,
       {
         enableScripts: true,
@@ -333,14 +373,36 @@ class AutoContinue {
           void config.update(msg.key, msg.value, vscode.ConfigurationTarget.Global);
         } else if (msg.type === 'toggleMonitoring') {
           this.toggle();
+        } else if (msg.type === 'simulateError') {
+          this.simulateError();
+        } else if (msg.type === 'markWindowActive') {
+          this.markWindowActive();
+        } else if (msg.type === 'runFullTest') {
+          this.runFullTest();
+        } else if (msg.type === 'toggleCdp') {
+          // Toggle CDP Auto Clicker and persist to config
+          const nowEnabled = this._cdpAutoClicker.isEnabled;
+          if (nowEnabled) {
+            this._cdpAutoClicker.stop();
+          } else {
+            this._cdpAutoClicker.start();
+          }
+          const config = vscode.workspace.getConfiguration('helmAutoContinue');
+          void config.update('cdpAutoClick', !nowEnabled, vscode.ConfigurationTarget.Global);
         }
       },
       undefined,
       this._context.subscriptions
     );
 
+    // Give the CDP clicker a reference to this panel so it can push live status updates
+    this._cdpAutoClicker.setSettingsPanelRef(this._settingsPanel);
+    // Push the current CDP state immediately so the panel reflects reality on first open
+    this._cdpAutoClicker.pushCdpStatus();
+
     this._settingsPanel.onDidDispose(() => {
       this._settingsPanel = undefined;
+      this._cdpAutoClicker.setSettingsPanelRef(undefined);
     });
   }
 
@@ -351,7 +413,7 @@ class AutoContinue {
     this._manualErrorFlag = true;
     this._log('⚠ Manual error reported — will send Continue on next tick');
     vscode.window.showInformationMessage(
-      'Helm Auto Continue: Error reported — will retry automatically.'
+      'Antigravity Recovery Auto Continue: Error reported — will retry automatically.'
     );
 
     if (!this._running) {
@@ -359,8 +421,93 @@ class AutoContinue {
     }
   }
 
+  /**
+   * Inject a synthetic "503 error" into the diagnostics scanning path.
+   *
+   * Sets a flag that _checkDiagnostics will detect on its next call and
+   * return as a real error — exercising the full detection → state machine
+   * → send Continue pipeline without needing an actual API error.
+   */
+   simulateError(): void {
+    if (!this._running) {
+      this.start();
+    }
+    this._simulatedErrorPending = true;
+    // Bypass Window Scope Recovery — simulated errors should always fire
+    this._everSeenBusy = true;
+    this._testRunActive = true;
+    this._pushTestLog('info', '🧪 Synthetic "503 error" queued — will fire on next diagnostics poll');
+    this._log('🧪 Test: synthetic "503 error" queued — will fire on next diagnostics poll');
+    vscode.window.showInformationMessage(
+      'Auto Continue: Synthetic error queued. Watch the test console for the recovery cycle.'
+    );
+  }
+
+  /**
+   * Mark this window as having seen the agent active.
+   * Sets _everSeenBusy = true so window scope recovery doesn’t suppress
+   * error detection. Use this before simulateError() when testing in a
+   * fresh window where the agent hasn’t actually been busy yet.
+   */
+  markWindowActive(): void {
+    this._everSeenBusy = true;
+    this._log('🧪 Test: window marked as active (_everSeenBusy = true)');
+    vscode.window.showInformationMessage(
+      'Auto Continue: Window marked as active — window scope check will no longer suppress errors.'
+    );
+  }
+
+  /**
+   * Run the full test pipeline: Mark Active + Simulate Error.
+   *
+   * Combines both steps into a single action and clears the test console
+   * so the user gets a clean trace of the detect → cooldown → send cycle.
+   */
+  runFullTest(): void {
+    // Clear the test console for a clean run
+    this._pushTestLog('clear', '');
+    this._pushTestLog('info', '🧪 === Full Pipeline Test ===');
+
+    // Step 1: Ensure monitoring is running (must happen BEFORE setting
+    // _everSeenBusy because start() resets it to false).
+    if (!this._running) {
+      this.start();
+      this._pushTestLog('info', '⚡ Monitoring was stopped — auto-started');
+    } else {
+      // Already running — reset gates that could suppress the test error:
+      // - _idleSince: prevents recovery timeout gate from swallowing it
+      // - _errorState: ensures we're in monitoring state to detect new errors
+      // - _capturedThisCycle: allows diagnostics capture for this test run
+      this._idleSince = null;
+      this._errorState = 'monitoring';
+      this._capturedThisCycle = false;
+      this._pushTestLog('info', '📡 Monitoring already active — gates reset for test');
+    }
+
+    // Step 2: Mark window active AFTER start() — bypasses window scope
+    // recovery gate that would otherwise suppress the simulated error.
+    // (start() resets _everSeenBusy = false, so this MUST come after.)
+    this._everSeenBusy = true;
+    this._pushTestLog('ok', '✔ Window marked as active (_everSeenBusy = true)');
+    this._log('🧪 Full test: window marked as active');
+
+    // Step 3: Queue synthetic 503 error
+    this._simulatedErrorPending = true;
+    this._testRunActive = true;
+    this._pushTestLog('info', '🧪 Synthetic "503 error" queued — will fire on next diagnostics poll');
+    this._pushTestLog('info', '⏳ Watching pipeline: detect → cooldown → send Continue...');
+    this._log('🧪 Full test: synthetic "503 error" queued — pipeline trace active');
+
+    // Show info message for visibility when called from command palette
+    // (the test console is only visible in the settings webview)
+    vscode.window.showInformationMessage(
+      'Auto Continue: Full test started — synthetic 503 queued. Open settings panel to watch the pipeline trace.'
+    );
+  }
+
   dispose(): void {
     this.stop();
+    this._cdpAutoClicker.dispose();
     this._settingsPanel?.dispose();
     this._statusBar.dispose();
     this._debugBar.dispose();
@@ -371,6 +518,19 @@ class AutoContinue {
     this._settingsPanel?.webview.postMessage({
       type: 'runningState',
       running: this._running,
+    });
+  }
+
+  /**
+   * Push a test log message to the settings webview's test console.
+   * Only sends when a test run is active AND the panel is open.
+   */
+  private _pushTestLog(level: 'info' | 'ok' | 'warn' | 'error' | 'clear', message: string): void {
+    this._settingsPanel?.webview.postMessage({
+      type: 'testLog',
+      level,
+      message,
+      ts: new Date().toLocaleTimeString(),
     });
   }
 
@@ -443,6 +603,9 @@ class AutoContinue {
         // Error detected — begin error→send cycle
         this._stats.errorsDetected++;
         this._log(`⚠ Error detected${result.source ? ` [${result.source}]` : ''}`);
+        if (this._testRunActive) {
+          this._pushTestLog('warn', `⚠ Error detected [${result.source ?? 'unknown'}]`);
+        }
 
         // Capture diagnostics once per error cycle
         if (!this._capturedThisCycle) {
@@ -450,14 +613,20 @@ class AutoContinue {
           void this._captureDiagnostics('error');
         }
 
-        if (isBusy) {
+        if (result.isRecent) {
           this._errorState = 'waiting_idle';
-          this._log('  Agent is busy — waiting for idle before cooldown');
+          this._log('  Agent recently active — waiting for idle before cooldown');
+          if (this._testRunActive) {
+            this._pushTestLog('info', '⏳ Agent recently active → WAITING_IDLE');
+          }
         } else {
           this._errorState = 'cooldown';
           this._cooldownStartedAt = Date.now();
           const cooldownMs = this._getConfig<number>('postSendCooldownMs', 10000);
           this._log(`  Agent is idle — starting ${Math.round(cooldownMs / 1000)}s cooldown`);
+          if (this._testRunActive) {
+            this._pushTestLog('info', `⏳ Agent idle → COOLDOWN (${Math.round(cooldownMs / 1000)}s)`);
+          }
         }
 
         void vscode.commands.executeCommand('setContext', 'helmAutoContinue.isRetrying', true);
@@ -466,16 +635,16 @@ class AutoContinue {
         break;
       }
 
-      // ─── WAITING_IDLE: error detected, agent busy, waiting for !busy ─
+      // ─── WAITING_IDLE: error detected, agent recently active, waiting for !recent ─
       case 'waiting_idle': {
-        if (!isBusy) {
+        if (!result.isRecent) {
           this._errorState = 'cooldown';
           this._cooldownStartedAt = Date.now();
           const cooldownMs = this._getConfig<number>('postSendCooldownMs', 10000);
-          this._log(`  Agent went idle — starting ${Math.round(cooldownMs / 1000)}s cooldown`);
+          this._log(`  Agent no longer active — starting ${Math.round(cooldownMs / 1000)}s cooldown`);
           this._updateDebugBar();
         } else {
-          this._logAt('normal', '  Still busy — waiting for idle...');
+          this._logAt('normal', `  Still active — waiting for idle...`);
         }
         break;
       }
@@ -492,6 +661,9 @@ class AutoContinue {
           this._manualErrorFlag = false;
 
           this._log(`↻ Sending "${prompt}" (total sends: ${this._stats.continuesSent})`);
+          if (this._testRunActive) {
+            this._pushTestLog('ok', `↻ Sending "${prompt}" to chat panel...`);
+          }
 
           // Reset state for next cycle
           this._errorState = 'monitoring';
@@ -501,17 +673,27 @@ class AutoContinue {
           this._idleSince = null;
           this._busyStart = null;
           this._lastSeenBusy = false;
-          this._stepIndexLastChanged = Date.now();
+          // Seed a synthetic step entry at the send time so busy-window
+          // detection doesn't immediately fire again before the agent responds.
+          this._stepHistory = [{ ts: Date.now(), step: -1 }];
 
           this._updateStatusBar();
           this._updateDebugBar();
 
           await this._sendToChatPanel(prompt);
 
+          if (this._testRunActive) {
+            this._pushTestLog('ok', '✅ Continue sent! Full pipeline test passed.');
+            this._testRunActive = false;
+          }
+
           void vscode.commands.executeCommand('setContext', 'helmAutoContinue.isRetrying', false);
         } else {
           const remaining = Math.round((cooldownMs - elapsed) / 1000);
           this._logAt('normal', `  ⏳ Cooldown: ${remaining}s remaining`);
+          if (this._testRunActive) {
+            this._pushTestLog('info', `⏳ Cooldown: ${remaining}s remaining...`);
+          }
         }
         break;
       }
@@ -536,7 +718,33 @@ class AutoContinue {
   private async _detectState(): Promise<ProbeResult> {
     const level = this._getLogLevel();
 
+    // Strategy 0: getDiagnostics log parsing (most reliable, no focus needed)
+    // NOTE: This runs BEFORE the recovery timeout gate so that busy/step
+    // tracking always executes. If the agent wakes up after being idle,
+    // _trackIdleState(true) clears _idleSince and the gate won't fire.
+    const diagFrequency = this._getConfig<number>('diagnosticsFrequency', 1);
+    this._diagPollCounter++;
+    const diagDue = (this._diagnosticsAvailable && this._diagPollCounter >= diagFrequency) || this._simulatedErrorPending;
+    if (level === 'verbose') {
+      this._log(`  [S0:diag] available=${this._diagnosticsAvailable} due=${diagDue} (counter=${this._diagPollCounter}/${diagFrequency})`);
+    }
+
+    let diagResult: ProbeResult | null = null;
+    if (diagDue) {
+      this._diagPollCounter = 0;
+      diagResult = await this._checkDiagnostics();
+      if (level === 'verbose') {
+        this._log(`  [S0:diag] result: error=${diagResult.hasError} busy=${diagResult.isBusy} recent=${diagResult.isRecent} source=${diagResult.source ?? 'none'}`);
+      }
+      // Track busy state FIRST — this may clear _idleSince if agent woke up
+      this._trackIdleState(diagResult.isBusy);
+    }
+
     // ─── Recovery Timeout Gate ──────────────────────────────────────────
+    // Now that busy tracking has run, check if the agent is STILL idle
+    // beyond the recovery threshold. This prevents stale errors from
+    // triggering recovery in inactive windows, while still allowing the
+    // gate to clear when the agent starts working again.
     const recoveryTimeoutSec = this._getConfig<number>('recoveryTimeoutSeconds', 300);
     if (recoveryTimeoutSec > 0 && this._idleSince) {
       const idleDuration = (Date.now() - this._idleSince) / 1000;
@@ -544,33 +752,19 @@ class AutoContinue {
         if (level === 'verbose') {
           this._log(`  [recovery-timeout] Agent idle for ${Math.round(idleDuration)}s (threshold: ${recoveryTimeoutSec}s) — suppressing error detection`);
         }
-        return { hasError: false, isBusy: false };
+        return { hasError: false, isBusy: false, isRecent: false };
       }
     }
 
-    // Strategy 0: getDiagnostics log parsing (most reliable, no focus needed)
-    const diagFrequency = this._getConfig<number>('diagnosticsFrequency', 1);
-    this._diagPollCounter++;
-    const diagDue = this._diagnosticsAvailable && this._diagPollCounter >= diagFrequency;
-    if (level === 'verbose') {
-      this._log(`  [S0:diag] available=${this._diagnosticsAvailable} due=${diagDue} (counter=${this._diagPollCounter}/${diagFrequency})`);
-    }
-    if (diagDue) {
-      this._diagPollCounter = 0;
-      const diagResult = await this._checkDiagnostics();
-      if (level === 'verbose') {
-        this._log(`  [S0:diag] result: error=${diagResult.hasError} busy=${diagResult.isBusy} source=${diagResult.source ?? 'none'}`);
-      }
-      this._trackIdleState(diagResult.isBusy);
-      if (diagResult.hasError) {
-        // Window Scope Recovery: require this window's agent was recently active
-        const windowScope = this._getConfig<boolean>('windowScopeRecovery', true);
-        if (windowScope && !this._everSeenBusy) {
-          this._logAt('normal', `  [S0:diag] Error suppressed by Window Scope Recovery — agent never active in this window`);
-        } else {
-          this._log(`  [detect] ★ Diagnostics: error found via ${diagResult.source}`);
-          return diagResult;
-        }
+    // Process diagnostics error result (deferred from above)
+    if (diagResult?.hasError) {
+      // Window Scope Recovery: require this window's agent was recently active
+      const windowScope = this._getConfig<boolean>('windowScopeRecovery', true);
+      if (windowScope && !this._everSeenBusy) {
+        this._logAt('normal', `  [S0:diag] Error suppressed by Window Scope Recovery — agent never active in this window`);
+      } else {
+        this._log(`  [detect] ★ Diagnostics: error found via ${diagResult.source}`);
+        return diagResult;
       }
     }
 
@@ -583,7 +777,7 @@ class AutoContinue {
       this._log('  [detect] ★ Context key: chatSessionResponseError=true');
       const busy = await this._readBusyKey();
       this._trackIdleState(busy);
-      return { hasError: true, isBusy: busy };
+      return { hasError: true, isBusy: busy, isRecent: busy || this._lastSeenBusy };
     } else if (this._contextKeysAvailable) {
       // Even when no error, try to read busy state for idle tracking
       const busy = await this._readBusyKey();
@@ -604,7 +798,7 @@ class AutoContinue {
 
       if (probeResult.hasError) {
         this._log('  [detect] ★ Focus probe: chatSessionResponseError=true');
-        return probeResult;
+        return { ...probeResult, isRecent: probeResult.isBusy || this._lastSeenBusy };
       }
     }
 
@@ -620,19 +814,19 @@ class AutoContinue {
       this._log(
         `  [detect] ★ Idle timeout: agent inactive for ${idleElapsed}s (threshold: ${idleTimeoutSec}s)`
       );
-      return { hasError: true, isBusy: false };
+      return { hasError: true, isBusy: false, isRecent: false };
     }
 
     // Strategy 4: Manual trigger
     if (this._manualErrorFlag) {
       this._log('  [detect] ★ Manual: error flag set by user');
-      return { hasError: true, isBusy: false };
+      return { hasError: true, isBusy: false, isRecent: false };
     }
 
     if (level === 'verbose') {
       this._log(`  [detect] No error detected by any strategy`);
     }
-    return { hasError: false, isBusy: this._lastSeenBusy };
+    return { hasError: false, isBusy: this._lastSeenBusy, isRecent: this._lastSeenBusy };
   }
 
   // ─── Idle Timeout Tracking ──────────────────────────────────────────────
@@ -734,7 +928,7 @@ class AutoContinue {
       this._log(`  [S2:probe] activeDoc=${activeDoc?.uri.toString().substring(0, 60) ?? 'none'} scheme=${activeDoc?.uri.scheme ?? 'n/a'}`);
     }
 
-    let result: ProbeResult = { hasError: false, isBusy: false };
+    let result: ProbeResult = { hasError: false, isBusy: false, isRecent: false };
     let isBusy = false;
 
     const focusStrategies: Array<{
@@ -798,7 +992,7 @@ class AutoContinue {
 
         if (errorVal === true) {
           this._log(`  [S2:probe] ★ Strategy "${strategy.name}" detected error!`);
-          result = { hasError: true, isBusy };
+          result = { hasError: true, isBusy, isRecent: false };
           break;
         }
 
@@ -806,7 +1000,7 @@ class AutoContinue {
           if (level === 'verbose') {
             this._log(`  [S2:probe] Strategy "${strategy.name}" can read error key (value=false, no error)`);
           }
-          result = { hasError: false, isBusy };
+          result = { hasError: false, isBusy, isRecent: false };
           break;
         }
 
@@ -1048,11 +1242,21 @@ class AutoContinue {
   private async _checkDiagnostics(): Promise<ProbeResult> {
     const level = this._getLogLevel();
     try {
+      // ─── Simulated error injection (dev/test) ─────────────────────────
+      if (this._simulatedErrorPending) {
+        this._simulatedErrorPending = false;
+        this._log('🧪 [diag] Simulated error firing — returning synthetic 503');
+        if (this._testRunActive) {
+          this._pushTestLog('warn', '🧪 Simulated 503 detected by diagnostics scanner');
+        }
+        return { hasError: true, isBusy: false, isRecent: false, source: 'simulated 503 (test)' };
+      }
+
       const raw = await vscode.commands.executeCommand<unknown>('antigravity.getDiagnostics');
       const diag = this._parseDiagnosticsResult(raw);
       if (!diag) {
         if (level === 'verbose') this._log(`  [diag] getDiagnostics returned empty/unparseable (type=${typeof raw})`);
-        return { hasError: false, isBusy: false };
+        return { hasError: false, isBusy: false, isRecent: false };
       }
 
       const sizeEstimate = typeof raw === 'string' ? Math.round(raw.length / 1024) : Math.round(JSON.stringify(raw).length / 1024);
@@ -1133,10 +1337,10 @@ class AutoContinue {
             if (match) {
               this._log(`  [diag] ⛔ ${sourceName} NON-RETRYABLE: "${match[0]}" — suppressing Continue`);
               vscode.window.showWarningMessage(
-                `Helm Auto Continue: Non-retryable error detected ("${match[0]}"). Auto-continue paused.`
+                `Antigravity Recovery Auto Continue: Non-retryable error detected ("${match[0]}"). Auto-continue paused.`
               );
               this.stop();
-              return { hasError: false, isBusy: false };
+              return { hasError: false, isBusy: false, isRecent: false };
             }
           }
 
@@ -1144,7 +1348,7 @@ class AutoContinue {
             const match = combinedNew.match(pattern);
             if (match) {
               this._log(`  [diag] ★ ${sourceName} error: "${match[0]}" in ${newEntries.length} new entries`);
-              return { hasError: true, isBusy: false, source: `${sourceName}: ${match[0]}` };
+              return { hasError: true, isBusy: false, isRecent: false, source: `${sourceName}: ${match[0]}` };
             }
           }
           if (level === 'verbose') this._log(`  [diag:${sourceName}] No error patterns matched`);
@@ -1154,58 +1358,140 @@ class AutoContinue {
         }
       }
 
-      // ─── B. Monitor conversation step index and activity for stalls ──
+      // ─── B. Monitor trajectory step index, agentStateDebug, and stalls ──
       const trajectories = diag.recentTrajectories;
-      let diagBusy = false;
+      let diagBusy = false;      // changed step THIS poll (hard fact)
+      let diagRecent = false;    // changed step within busy window (softer)
+
       if (Array.isArray(trajectories) && trajectories.length > 0) {
         const active = trajectories[0];
-        const currentStep = active.lastStepIndex ?? 0;
-        const stepsChanged = this._lastKnownStepIndex !== null && currentStep !== this._lastKnownStepIndex;
-        const stepStallSec = this._stepIndexLastChanged
-          ? Math.round((Date.now() - this._stepIndexLastChanged) / 1000)
-          : null;
+        const trajectoryId: string = active.googleAgentId ?? '';
+        const currentStep: number = active.lastStepIndex ?? 0;
 
         const lastModified = active.lastModifiedTime ? new Date(active.lastModifiedTime).getTime() : 0;
-        const timeSinceModified = lastModified > 0 ? Date.now() - lastModified : Infinity;
-        diagBusy = timeSinceModified < 30_000;
+        // Only consider trajectories that were modified after this window started.
+        // This prevents another window's older trajectory from polluting our detection.
+        const trajectoryIsFromThisSession = lastModified > this._monitoringStartedAt;
 
-        if (level === 'verbose') {
-          this._log(`  [diag:traj] id=${active.googleAgentId?.substring(0, 8) ?? '?'}... step=${currentStep} prevStep=${this._lastKnownStepIndex} changed=${stepsChanged} stallAge=${stepStallSec ?? 'n/a'}s lastModified=${Math.round(timeSinceModified / 1000)}s ago diagBusy=${diagBusy} summary="${(active.summary || '').substring(0, 60)}"`);
+        // ── Step history management ────────────────────────────────────────
+        // Record this poll's observation. We do this regardless of whether
+        // the step changed, so the buffer always reflects real poll cadence.
+        const prevEntry = this._stepHistory.length > 0
+          ? this._stepHistory[this._stepHistory.length - 1]
+          : null;
+        const stepChangedThisPoll = prevEntry !== null && prevEntry.step !== currentStep;
+
+        this._stepHistory.push({ ts: Date.now(), step: currentStep });
+        if (this._stepHistory.length > AutoContinue.STEP_HISTORY_SIZE) {
+          this._stepHistory.shift();
         }
 
-        if (this._lastKnownStepIndex !== null) {
-          if (stepsChanged) {
-            this._stepIndexLastChanged = Date.now();
-            this._lastKnownStepIndex = currentStep;
+        // Check if there is an active local chat session request in progress in this window.
+        // This prevents binding to active trajectories in other windows.
+        const isLocalWindowBusy = await this._readBusyKey();
+
+        // ── Trajectory binding ─────────────────────────────────────────────
+        // Bind to a trajectory on a step-change if it is from this session and a local request
+        // is in progress in this window.
+        if (stepChangedThisPoll && trajectoryIsFromThisSession && isLocalWindowBusy) {
+          if (this._boundTrajectoryId !== trajectoryId) {
+            this._logAt('normal', `  [diag:traj] Bound to trajectory ${trajectoryId.substring(0, 8)}... (step ${prevEntry?.step ?? '?'} → ${currentStep})`);
+            this._boundTrajectoryId = trajectoryId;
+          }
+          // A step change IS direct proof the agent ran — set _everSeenBusy
+          // so busy/stall detection and window scope recovery work correctly.
+          if (!this._everSeenBusy) {
+            this._everSeenBusy = true;
+            this._logAt('normal', `  [diag:traj] Agent activity confirmed via step change — window marked active`);
+          }
+        }
+
+        // ── Is this our trajectory? ────────────────────────────────────────
+        // Only consider it our trajectory if we are bound to it.
+        const isOurTrajectory = this._boundTrajectoryId === trajectoryId;
+
+        if (isOurTrajectory && this._everSeenBusy) {
+          // isBusy (hard): step changed on THIS poll
+          diagBusy = stepChangedThisPoll;
+
+          // isRecent (soft): any step change recorded anywhere in the history buffer.
+          // History holds the last STEP_HISTORY_SIZE polls, so isRecent naturally
+          // expires after N polls of silence — no time window needed.
+          for (let i = this._stepHistory.length - 1; i >= 1; i--) {
+            if (this._stepHistory[i].step !== this._stepHistory[i - 1].step) {
+              diagRecent = true;
+              break;
+            }
+          }
+
+          if (level === 'verbose') {
+            const histSummary = this._stepHistory.map(e => e.step).join('→');
+            this._log(`  [diag:traj] id=${trajectoryId.substring(0, 8)}... step=${currentStep} changed=${stepChangedThisPoll} isOurs=${isOurTrajectory} diagBusy=${diagBusy} diagRecent=${diagRecent} history=[${histSummary}] bound=${this._boundTrajectoryId?.substring(0, 8) ?? 'none'} summary="${(active.summary || '').substring(0, 60)}"`);
+          }
+
+          // ── Stall detection via step history ─────────────────────────────
+          // Independent of isRecent — fires based on real elapsed time since
+          // the last step change, regardless of how many polls have occurred.
+          const idleTimeoutSec = this._getConfig<number>('idleTimeoutSeconds', 0);
+          if (idleTimeoutSec > 0 && this._stepHistory.length >= 2) {
+            // Find the timestamp of the last step change in history
+            let lastChangeTs: number | null = null;
+            for (let i = this._stepHistory.length - 1; i >= 1; i--) {
+              if (this._stepHistory[i].step !== this._stepHistory[i - 1].step) {
+                lastChangeTs = this._stepHistory[i].ts;
+                break;
+              }
+            }
+            if (lastChangeTs !== null) {
+              const stallDuration = Date.now() - lastChangeTs;
+              if (stallDuration >= idleTimeoutSec * 1000) {
+                const stallSec = Math.round(stallDuration / 1000);
+                this._log(`  [diag] ★ Stall detected: step ${currentStep} unchanged for ${stallSec}s (threshold: ${idleTimeoutSec}s)`);
+                return { hasError: true, isBusy: false, isRecent: false, source: `stall (${stallSec}s at step ${currentStep})` };
+              }
+            }
           }
         } else {
-          this._lastKnownStepIndex = currentStep;
-          this._stepIndexLastChanged = Date.now();
-        }
-
-        const idleTimeoutSec = this._getConfig<number>('idleTimeoutSeconds', 0);
-        const trajectoryIsFromThisSession = lastModified > this._monitoringStartedAt;
-        if (idleTimeoutSec > 0
-          && this._stepIndexLastChanged
-          && this._lastKnownStepIndex !== null
-          && !diagBusy
-          && trajectoryIsFromThisSession
-        ) {
-          const stallDuration = Date.now() - this._stepIndexLastChanged;
-          if (stallDuration >= idleTimeoutSec * 1000) {
-            const stallSec = Math.round(stallDuration / 1000);
-            this._log(`  [diag] ★ Trajectory stall: step ${this._lastKnownStepIndex} unchanged for ${stallSec}s (threshold: ${idleTimeoutSec}s)`);
-            return { hasError: true, isBusy: false, source: `trajectory stall (${stallSec}s at step ${this._lastKnownStepIndex})` };
+          if (level === 'verbose') {
+            this._log(`  [diag:traj] id=${trajectoryId.substring(0, 8)}... step=${currentStep} isOurs=${isOurTrajectory} everBusy=${this._everSeenBusy} — skipped (not ours or never busy)`);
           }
         }
       } else {
         if (level === 'verbose') this._log(`  [diag:traj] No trajectories found`);
       }
 
-      return { hasError: false, isBusy: diagBusy };
+      // ─── C. agentStateDebug.conversations — direct activity signal ────
+      // If the diagnostics payload includes a conversations map with any
+      // entry in an active/running state, use it as an additional busy signal.
+      // This is inherently global (same backend), but its presence here tells us
+      // the Antigravity engine considers something active right now.
+      const agentState = diag.agentStateDebug as Record<string, unknown> | undefined;
+      if (agentState && typeof agentState === 'object') {
+        const convMap = agentState.conversations as Record<string, unknown> | undefined;
+        if (convMap && typeof convMap === 'object') {
+          const activeConversations = Object.values(convMap).filter(
+            (v: unknown) => v && typeof v === 'object' && (
+              (v as any).status === 'running' ||
+              (v as any).status === 'active' ||
+              (v as any).isActive === true
+            )
+          );
+          if (activeConversations.length > 0 && this._everSeenBusy) {
+            if (level === 'verbose') {
+              this._log(`  [diag:conversations] ${activeConversations.length} active conversation(s) found — boosting diagBusy/diagRecent`);
+            }
+            diagBusy = true;
+            diagRecent = true;
+          } else if (level === 'verbose' && Object.keys(convMap).length > 0) {
+            this._log(`  [diag:conversations] ${Object.keys(convMap).length} conversation(s) present, none active`);
+          }
+        }
+      }
+
+      return { hasError: false, isBusy: diagBusy, isRecent: diagRecent };
     } catch (e: any) {
       this._log(`  [diag] getDiagnostics call failed: ${e.message ?? 'unknown'}`);
-      return { hasError: false, isBusy: false };
+      return { hasError: false, isBusy: false, isRecent: false };
     }
   }
 
@@ -1309,7 +1595,7 @@ class AutoContinue {
     }
     this._logAt('normal', '  → Clipboard fallback — prompt copied');
     vscode.window.showWarningMessage(
-      'Helm Auto Continue: Prompt copied to clipboard — paste (Ctrl+V) in the chat.',
+      'Antigravity Recovery Auto Continue: Prompt copied to clipboard — paste (Ctrl+V) in the chat.',
       'Dismiss'
     );
   }
@@ -1318,6 +1604,7 @@ class AutoContinue {
 
   private _getSettingsHtml(logoUri: vscode.Uri): string {
     const config = vscode.workspace.getConfiguration('helmAutoContinue');
+    const extensionVersion: string = (this._context.extension.packageJSON as { version?: string }).version ?? '?';
     const settings = {
       intervalSeconds: config.get<number>('intervalSeconds', 5),
       idleTimeoutSeconds: config.get<number>('idleTimeoutSeconds', 0),
@@ -1331,6 +1618,7 @@ class AutoContinue {
       recoveryTimeoutSeconds: config.get<number>('recoveryTimeoutSeconds', 300),
       errorPatterns: config.get<string[]>('errorPatterns', DEFAULT_ERROR_PATTERNS),
       suppressPatterns: config.get<string[]>('suppressPatterns', DEFAULT_SUPPRESS_PATTERNS),
+      cdpAutoClick: config.get<boolean>('cdpAutoClick', false),
     };
 
     return `<!DOCTYPE html>
@@ -1338,7 +1626,7 @@ class AutoContinue {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Helm Auto Continue Settings</title>
+<title>Antigravity Recovery Auto Continue Settings</title>
 <style>
   :root {
     --bg: #1e1e1e;
@@ -1649,13 +1937,9 @@ class AutoContinue {
 </head>
 <body>
   <div class="header">
-    <img src="${logoUri}" alt="Helm" width="28" height="28" style="flex-shrink: 0;">
-    <h1>Helm — Antigravity Auto Continue</h1>
-    <span class="badge">v1.21.1</span>
-  </div>
-
-  <div class="promo">
-    🔗 <a href="https://helm-agent.com">helm-agent.com</a> — Full AI task management for VS Code
+    <img src="${logoUri}" alt="Antigravity" width="28" height="28" style="flex-shrink: 0;">
+    <h1>Antigravity Recovery Auto Continue</h1>
+    <span class="badge">v${extensionVersion}</span>
   </div>
 
   <div class="monitor-card ${this._running ? 'active' : ''}" id="monitorCard">
@@ -1670,6 +1954,71 @@ class AutoContinue {
       <span class="slider"></span>
     </label>
   </div>
+
+  <!-- ─── CDP Auto Clicker ──────────────────────────────────────────────── -->
+
+  <div class="monitor-card ${settings.cdpAutoClick ? 'active' : ''}" id="cdpCard">
+    <div class="monitor-info">
+      <div class="monitor-label">CDP Auto Clicker</div>
+      <div class="monitor-status ${settings.cdpAutoClick ? 'on' : 'off'}" id="cdpStatus">
+        ${settings.cdpAutoClick ? '● Active — clicking buttons' : '○ Stopped'}
+      </div>
+    </div>
+    <label class="toggle">
+      <input type="checkbox" id="cdpToggle" ${settings.cdpAutoClick ? 'checked' : ''}>
+      <span class="slider"></span>
+    </label>
+  </div>
+
+  <div id="cdpDetails" style="display:${settings.cdpAutoClick ? 'block' : 'none'}; margin-bottom:16px;">
+    <div class="setting" style="flex-direction:column; align-items:stretch; margin-bottom:8px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+        <span style="font-size:12px; color:var(--text-muted);">Debug Port Status</span>
+        <span id="cdpPortBadge" style="font-size:11px; font-weight:600; padding:2px 8px; border-radius:10px; background:rgba(244,107,65,.15); color:#f47041;">Antigravity not detected</span>
+      </div>
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <span style="font-size:12px; color:var(--text-muted);">Session Clicks</span>
+        <span id="cdpClickCount" style="font-size:14px; font-weight:700; color:var(--text-bright);">0</span>
+      </div>
+    </div>
+
+    <div style="padding:12px 16px; background:rgba(0,120,212,0.07); border:1px solid rgba(0,120,212,0.25);
+      border-radius:6px; margin-bottom:8px; font-size:12px; line-height:1.6; color:var(--text-muted);">
+      <div style="font-weight:600; color:var(--accent); margin-bottom:6px;">⚙ One-time setup required</div>
+      <div>
+        Antigravity must be launched with the Chrome DevTools debug port open so that Auto Clicker can inject into its webviews.
+      </div>
+      <div style="margin-top:8px; font-weight:500; color:var(--text-bright);">Add this flag to your Antigravity shortcut / launch command:</div>
+      <div style="font-family:'Consolas','Monaco',monospace; font-size:11px; background:#1a1a1a; border:1px solid var(--border);
+        border-radius:4px; padding:6px 10px; margin-top:6px; word-break:break-all; color:#4ec9b0; user-select:all;">
+        --remote-debugging-port=9333
+      </div>
+      <div style="margin-top:8px;">
+        <strong style="color:var(--text-bright);">Windows shortcut:</strong>
+        Right-click your Antigravity shortcut → Properties → Target field →
+        append <code style="background:#222; padding:1px 4px; border-radius:3px;">--remote-debugging-port=9333</code>
+        after the closing <code style="background:#222; padding:1px 4px; border-radius:3px;">"</code>, then click OK.
+        Relaunch Antigravity from the shortcut.
+      </div>
+      <div style="margin-top:6px;">
+        <strong style="color:var(--text-bright);">macOS / Linux terminal:</strong>
+        Close Antigravity, then launch from Terminal:
+        <code style="background:#222; padding:1px 4px; border-radius:3px;">"path/to/Antigravity IDE" --remote-debugging-port=9333</code>
+      </div>
+      <div style="margin-top:6px; color:#888; font-size:11px;">
+        The status badge above will show "Connected" once Antigravity is running with the debug port open.
+        You only need to do this once if you save the modified shortcut.
+      </div>
+    </div>
+
+    <div style="padding:10px 14px; background:var(--surface); border:1px solid var(--border);
+      border-radius:6px; font-size:11px; color:var(--text-muted); line-height:1.6;">
+      <div style="font-weight:600; color:var(--text-bright); margin-bottom:4px;">Buttons clicked automatically:</div>
+      Run · Accept · Accept All · Allow · Always Allow · Apply · Approve · Retry · Continue · Confirm
+    </div>
+  </div>
+
+  <!-- ─────────────────────────────────────────────────────────────────── -->
 
   <div class="section">
     <div class="section-title">Core</div>
@@ -1736,8 +2085,8 @@ class AutoContinue {
 
     <div class="setting">
       <div class="setting-info">
-        <div class="setting-label">Idle Timeout</div>
-        <div class="setting-desc">Seconds of inactivity to trigger recovery. 0 = disabled (recommended).</div>
+        <div class="setting-label">Stall Detection</div>
+        <div class="setting-desc">If the agent's step index hasn't advanced in this many seconds, assume it silently stopped and send Continue. Useful for catching failures that don't log an error. Set to roughly how long your longest tool call takes. 0 = disabled.</div>
       </div>
       <div class="setting-control">
         <input type="number" class="num-input" id="idleTimeoutSeconds" min="0" value="${settings.idleTimeoutSeconds}">
@@ -1820,6 +2169,53 @@ class AutoContinue {
     </div>
   </div>
 
+  <div class="section">
+    <div class="section-title">Developer Tools</div>
+
+    <div class="setting" style="flex-direction: column; align-items: stretch; gap: 12px;">
+      <div class="setting-desc" style="line-height: 1.5; color: var(--text-muted); margin-bottom: 4px;">
+        To run a test, open the VS Code Command Palette using <kbd style="
+          background: #333;
+          padding: 2px 5px;
+          border-radius: 3px;
+          font-family: inherit;
+          font-size: 0.9em;
+          color: var(--text-bright);
+        ">Ctrl+Shift+P</kbd> (or <kbd style="
+          background: #333;
+          padding: 2px 5px;
+          border-radius: 3px;
+          font-family: inherit;
+          font-size: 0.9em;
+          color: var(--text-bright);
+        ">Cmd+Shift+P</kbd> on macOS) and run one of the following commands:
+      </div>
+      <div style="font-size: 12px; line-height: 1.6; display: flex; flex-direction: column; gap: 8px; color: var(--text-bright); margin-bottom: 4px;">
+        <div>● <strong>Antigravity Recovery Auto Continue: Run Full Test</strong><br>
+        <span style="color: var(--text-muted); font-size: 11px; margin-left: 14px; display: inline-block;">Runs the complete test pipeline (auto-starts monitoring, marks window active, queues synthetic error) and traces it below.</span></div>
+        <div>● <strong>Antigravity Recovery Auto Continue: Simulate Error (Test)</strong><br>
+        <span style="color: var(--text-muted); font-size: 11px; margin-left: 14px; display: inline-block;">Queues a synthetic "503 error" to fire on the next diagnostics poll.</span></div>
+        <div>● <strong>Antigravity Recovery Auto Continue: Mark Window Active (Test)</strong><br>
+        <span style="color: var(--text-muted); font-size: 11px; margin-left: 14px; display: inline-block;">Bypasses window scope recovery by marking this window as active.</span></div>
+      </div>
+      <div id="testConsole" style="
+        min-height: 80px;
+        max-height: 240px;
+        overflow-y: auto;
+        padding: 10px 12px;
+        background: #1a1a1a;
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+        font-size: 11px;
+        line-height: 1.7;
+        color: var(--text-muted);
+        white-space: pre-wrap;
+        word-break: break-all;
+      "><span style="color: var(--text-muted);">Use the Command Palette to run a test and view logs here...</span></div>
+    </div>
+  </div>
+
   <div class="saved-toast" id="toast">✓ Saved</div>
 
   <script>
@@ -1838,6 +2234,41 @@ class AutoContinue {
       vscode.postMessage({ type: 'toggleMonitoring' });
     });
 
+    // Note: click listeners and flashBtn helper are removed as Developer Tools commands are run via the Command Palette
+
+    // Test console log rendering
+    const testConsole = document.getElementById('testConsole');
+    const LOG_COLORS = {
+      info: 'var(--accent-hover)',
+      ok: 'var(--success)',
+      warn: '#e5c07b',
+      error: 'var(--danger)',
+    };
+
+    function appendTestLog(level, message, ts) {
+      if (level === 'clear') {
+        testConsole.innerHTML = '';
+        return;
+      }
+      const line = document.createElement('div');
+      line.style.color = LOG_COLORS[level] || 'var(--text-muted)';
+      line.textContent = '[' + ts + '] ' + message;
+      testConsole.appendChild(line);
+      testConsole.scrollTop = testConsole.scrollHeight;
+    }
+
+    // CDP Auto Clicker toggle
+    const cdpToggle    = document.getElementById('cdpToggle');
+    const cdpCard      = document.getElementById('cdpCard');
+    const cdpStatusEl  = document.getElementById('cdpStatus');
+    const cdpDetails   = document.getElementById('cdpDetails');
+    const cdpPortBadge = document.getElementById('cdpPortBadge');
+    const cdpClickCount = document.getElementById('cdpClickCount');
+
+    cdpToggle.addEventListener('change', () => {
+      vscode.postMessage({ type: 'toggleCdp' });
+    });
+
     // Listen for state pushes from extension
     window.addEventListener('message', (event) => {
       const msg = event.data;
@@ -1854,6 +2285,37 @@ class AutoContinue {
           status.className = 'monitor-status off';
           status.textContent = '○ Stopped';
         }
+      } else if (msg.type === 'testLog') {
+        appendTestLog(msg.level, msg.message, msg.ts);
+      } else if (msg.type === 'cdpStatus') {
+        // Update CDP toggle card
+        cdpToggle.checked = msg.enabled;
+        cdpDetails.style.display = msg.enabled ? 'block' : 'none';
+        if (msg.enabled) {
+          cdpCard.classList.add('active');
+          cdpStatusEl.className = 'monitor-status on';
+          cdpStatusEl.textContent = '● Active — clicking buttons';
+        } else {
+          cdpCard.classList.remove('active');
+          cdpStatusEl.className = 'monitor-status off';
+          cdpStatusEl.textContent = '○ Stopped';
+        }
+        // Update port status badge
+        if (msg.connected) {
+          cdpPortBadge.textContent = '✓ Connected';
+          cdpPortBadge.style.background = 'rgba(78,201,176,.12)';
+          cdpPortBadge.style.color = '#4ec9b0';
+        } else if (msg.agRunning) {
+          cdpPortBadge.textContent = '⚠ AG running — no debug port';
+          cdpPortBadge.style.background = 'rgba(229,192,123,.12)';
+          cdpPortBadge.style.color = '#e5c07b';
+        } else {
+          cdpPortBadge.textContent = 'Antigravity not detected';
+          cdpPortBadge.style.background = 'rgba(244,107,65,.15)';
+          cdpPortBadge.style.color = '#f47041';
+        }
+        // Update session click counter
+        cdpClickCount.textContent = String(msg.sessionClicks ?? 0);
       }
     });
 
@@ -1969,16 +2431,16 @@ class AutoContinue {
       if (this._errorState !== 'monitoring') {
         const phase = this._errorState === 'waiting_idle' ? 'waiting' : 'cooldown';
         this._statusBar.text = `$(sync~spin) Auto Continue (${phase})`;
-        this._statusBar.tooltip = `Helm Auto Continue — ${phase}. Click for settings.`;
+        this._statusBar.tooltip = `Antigravity Recovery Auto Continue — ${phase}. Click for settings.`;
         this._statusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
       } else {
         this._statusBar.text = '$(eye) Auto Continue';
-        this._statusBar.tooltip = 'Helm Auto Continue is monitoring — click for settings';
+        this._statusBar.tooltip = 'Antigravity Recovery Auto Continue is monitoring — click for settings';
         this._statusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.prominentBackground');
       }
     } else {
       this._statusBar.text = '$(eye-closed) Auto Continue';
-      this._statusBar.tooltip = 'Helm Auto Continue is off — click for settings';
+      this._statusBar.tooltip = 'Antigravity Recovery Auto Continue is off — click for settings';
       this._statusBar.backgroundColor = undefined;
     }
   }
@@ -2017,6 +2479,579 @@ class AutoContinue {
   }
 }
 
+// ─── CDP Auto Clicker ──────────────────────────────────────────────────────
+//
+// Runs an independent Chrome DevTools Protocol DOM-injection clicking loop.
+// Every 2 seconds, probes Antigravity's debug ports, injects a MutationObserver
+// script into every reachable webview via Runtime.evaluate, and clicks action
+// buttons (Run, Accept, Allow, Apply, Approve, Retry, Continue, Confirm) as they
+// appear in the Antigravity UI.
+//
+// Completely separate from the error-recovery monitor — enabled/disabled via its
+// own toggle in the settings page, no auth, no quota, no heartbeat.
+
+class CdpAutoClicker {
+
+  // ─── CDP ports to probe in order ──────────────────────────────────────
+  private static readonly PORTS = [9333, 9222, 9000, 5229];
+
+  // ─── How often to run the full injection cycle ─────────────────────────
+  private static readonly INJECT_MS = 2000;
+
+  // ─── Cross-target deduplication window ────────────────────────────────
+  // Covers the worst-case wsEval round-trip across multiple open webview
+  // targets (~1-2s each) with a large safety margin.
+  private static readonly DEDUP_MS = 8000;
+
+  // ─── OBSERVER_JS ──────────────────────────────────────────────────────
+  // Self-contained JavaScript injected into every Antigravity webview via
+  // CDP Runtime.evaluate. Runs inside the Electron renderer process.
+  //
+  // Design notes:
+  //   • Uses self.* instead of window.* — works in window and worker scopes.
+  //   • Generation counter (__helmGen) allows a newer injection to instantly
+  //     terminate any older instance that is still ticking.
+  //   • Position-key cooldown survives React DOM re-renders: the key is based
+  //     on the button's screen coordinates (quantised to a 30px grid) + label
+  //     prefix rather than the DOM element reference, so a fresh element at
+  //     the same position is recognised and blocked until it disappears.
+  //   • MutationObserver fires a debounced scan on DOM changes; the fallback
+  //     setInterval loop catches buttons that appear without triggering mutations.
+  //   • Returns JSON so the extension can diff cumulative click counts across
+  //     injection cycles without re-counting clicks made by previous cycles.
+  private static readonly OBSERVER_JS = `
+(function() {
+  // Helm CDP Clicker — injected into Antigravity webviews.
+  // Each injection bumps the generation so any older loop self-terminates.
+  var GEN = (self.__helmGen = (self.__helmGen || 0) + 1);
+
+  // Tear down the previous observer instance if one is running
+  if (self.__helmObs) { try { self.__helmObs.disconnect(); } catch(e) {} self.__helmObs = null; }
+  clearTimeout(self.__helmDeb);
+
+  // Persistent state (initialised once; survives re-injection)
+  if (!self.__helmTs)      self.__helmTs      = new WeakMap(); // el → timestamp of last click
+  if (!self.__helmElPos)   self.__helmElPos   = new WeakMap(); // el → posKey stored at click time
+  if (!self.__helmBlocked) self.__helmBlocked = {};            // posKey → true (occupied)
+  if (!self.__helmLabels)  self.__helmLabels  = [];            // last 5 clicked button labels
+  if (!self.__helmCount)   self.__helmCount   = 0;             // cumulative click counter
+
+  var COOL = 1500; // ms to wait before re-clicking the same DOM element
+
+  // Labels that must always be skipped — VS Code merge-editor buttons that
+  // share names with our targets and should never be auto-clicked.
+  var NEVER = [
+    'accept all changes', 'accept current change',
+    'accept incoming',    'accept both changes',
+    'running', 'runner', 'runtime', 'runbook'
+  ];
+
+  function shouldNeverClick(lo) {
+    for (var i = 0; i < NEVER.length; i++) {
+      if (lo.indexOf(NEVER[i]) >= 0) return true;
+    }
+    return false;
+  }
+
+  // Strip non-printable chars and leading non-alpha chars from element text
+  function cleanLabel(raw) {
+    return (raw || '')
+      .replace(/[^\\x20-\\x7E]+/g, ' ')
+      .replace(/\\s+/g, ' ').trim()
+      .replace(/^[^a-zA-Z]+/, '').trim();
+  }
+
+  // True when the element is visible and has a meaningful size on screen
+  function isVisible(el) {
+    var r = el.getBoundingClientRect();
+    var s = getComputedStyle(el);
+    return r.width  > 0 && r.height > 0
+        && s.display !== 'none'
+        && s.visibility !== 'hidden'
+        && parseFloat(s.opacity) > 0;
+  }
+
+  // Position key — label prefix + quantised screen coords.
+  // Survives React re-renders that destroy and recreate the DOM element
+  // because the new element appears at the same screen location.
+  function posKey(el, label) {
+    var r = el.getBoundingClientRect();
+    return label.slice(0, 20) + ':' + (Math.round(r.left / 30) * 30) + ':' + (Math.round(r.top / 30) * 30);
+  }
+
+  // True if this button label is one we should click
+  function isClickTarget(lo) {
+    var firstWord = lo.split(/[^a-z]/)[0];
+    return firstWord === 'run'    ||
+           firstWord === 'accept' ||
+           firstWord === 'allow'  ||
+           firstWord === 'apply'  ||
+           firstWord === 'approve'||
+           firstWord === 'retry'  ||
+           firstWord === 'submit' ||
+           lo === 'continue'      ||
+           lo === 'confirm'       ||
+           lo === 'always allow'  ||
+           lo.indexOf('always allow') >= 0;
+  }
+
+  // When elements leave the DOM, unblock the positions they occupied.
+  // Primary path: use the posKey stored in __helmElPos at click time.
+  // Fallback:     scan __helmBlocked for a key matching the label prefix.
+  function releaseRemovedPositions(mutations) {
+    if (!Object.keys(self.__helmBlocked).length) return;
+    mutations.forEach(function(m) {
+      m.removedNodes.forEach(function(node) {
+        if (node.nodeType !== 1) return;
+        var candidates = [node];
+        try { [].push.apply(candidates, node.querySelectorAll('button,[role="button"]')); } catch(e) {}
+        candidates.forEach(function(el) {
+          // Primary: stored posKey
+          var pk = self.__helmElPos.get(el);
+          if (pk && self.__helmBlocked[pk]) { delete self.__helmBlocked[pk]; return; }
+          // Fallback: label prefix scan
+          var lbl = cleanLabel(el.textContent);
+          var lo  = lbl.toLowerCase();
+          if (!lbl || shouldNeverClick(lo) || !isClickTarget(lo)) return;
+          var prefix = lbl.slice(0, 20);
+          for (var key in self.__helmBlocked) {
+            if (key.indexOf(prefix) === 0) { delete self.__helmBlocked[key]; }
+          }
+        });
+      });
+    });
+  }
+
+  function scanAndClick() {
+    var candidates = document.body.querySelectorAll(
+      'button, [role="button"], ' +
+      '[data-testid*="run"], [data-testid*="accept"], [data-testid*="allow"]'
+    );
+    var now = Date.now();
+
+    // Remove stale position blocks whose position is no longer occupied by any
+    // visible target — catches cases where elements leave without a mutation event.
+    var activeKeys = {};
+    candidates.forEach(function(el) {
+      if (el.disabled || !isVisible(el)) return;
+      var lbl = cleanLabel(el.textContent);
+      var lo  = lbl.toLowerCase();
+      if (shouldNeverClick(lo) || !isClickTarget(lo)) return;
+      var r = el.getBoundingClientRect();
+      if (r.width <= 20 || r.height <= 10) return;
+      activeKeys[posKey(el, lbl)] = true;
+    });
+    for (var pk in self.__helmBlocked) {
+      if (!activeKeys[pk]) delete self.__helmBlocked[pk];
+    }
+
+    // Click every eligible element
+    candidates.forEach(function(el) {
+      if (now - (self.__helmTs.get(el) || 0) < COOL) return; // element still in cooldown
+      if (el.disabled || !isVisible(el)) return;
+      var lbl = cleanLabel(el.textContent);
+      var lo  = lbl.toLowerCase();
+      if (shouldNeverClick(lo) || !isClickTarget(lo)) return;
+      var r = el.getBoundingClientRect();
+      if (r.width <= 20 || r.height <= 10) return;
+      var pk = posKey(el, lbl);
+      if (self.__helmBlocked[pk]) return; // same screen position still occupied
+
+      // Record and click
+      self.__helmTs.set(el, now);
+      self.__helmElPos.set(el, pk);
+      self.__helmBlocked[pk] = true;
+      el.click();
+      self.__helmCount++;
+      self.__helmLabels.push(lbl);
+      if (self.__helmLabels.length > 5) self.__helmLabels.shift();
+    });
+  }
+
+  // MutationObserver fires a debounced scan on any DOM change
+  self.__helmObs = new MutationObserver(function(mutations) {
+    releaseRemovedPositions(mutations);
+    clearTimeout(self.__helmDeb);
+    self.__helmDeb = setTimeout(scanAndClick, 40);
+  });
+  self.__helmObs.observe(document.body, {
+    childList: true, subtree: true,
+    attributes: true, attributeFilter: ['disabled', 'aria-disabled', 'class']
+  });
+
+  // Fallback polling loop — catches buttons that appear without DOM mutations.
+  // Self-terminates when a newer injection bumps __helmGen.
+  (function loop(gen) {
+    if (self.__helmGen !== gen) return;
+    scanAndClick();
+    setTimeout(function() { loop(gen); }, 600);
+  })(GEN);
+
+  // Immediate scan on injection
+  scanAndClick();
+  return JSON.stringify({
+    gen:    GEN,
+    count:  self.__helmCount,
+    labels: self.__helmLabels.slice(),
+  });
+})()`;
+
+  // ─── KILL_JS ─────────────────────────────────────────────────────────
+  // Injected into all live targets when the clicker is stopped.
+  // Bumping __helmGen causes any active loop() call to self-terminate on
+  // its next tick without needing an explicit clearTimeout.
+  private static readonly KILL_JS = `(function() {
+  self.__helmGen = (self.__helmGen || 0) + 1;
+  if (self.__helmObs) { try { self.__helmObs.disconnect(); } catch(e) {} self.__helmObs = null; }
+  clearTimeout(self.__helmDeb);
+})();`;
+
+  // ─── Instance state ───────────────────────────────────────────────────
+
+  private _timer:          ReturnType<typeof setInterval> | null = null;
+  private _enabled         = false;
+  private _sessionClicks   = 0;         // Resets on each start()
+  private _cdpConnected    = false;     // True when >= 1 port responded
+  private _agRunning       = false;     // Last known AG process state
+  private _firstProbe      = true;      // Has the first CDP probe completed?
+  private _probeCycleCount = 0;         // For throttling _detectAgProcess
+
+  // Per-target click count baseline: webSocketDebuggerUrl → last observed counter
+  private readonly _targetCounts: Record<string, number> = {};
+
+  // Cross-target deduplication: label → timestamp last counted
+  private readonly _dedup: Map<string, number> = new Map();
+
+  // Reference to the open settings panel (undefined when closed)
+  private _settingsPanelRef?: vscode.WebviewPanel;
+
+  // Status bar item: shows $(mouse) AutoClick OFF | $(mouse) AutoClick N
+  private _statusBar: vscode.StatusBarItem;
+
+  constructor(
+    private readonly _context: vscode.ExtensionContext,
+    private readonly _log: (msg: string) => void,
+  ) {
+    this._statusBar = vscode.window.createStatusBarItem(
+      vscode.StatusBarAlignment.Left, 95
+    );
+    this._statusBar.command = 'helmAutoContinue.openSettings';
+    this._refreshStatusBar();
+    this._statusBar.show();
+    _context.subscriptions.push(this._statusBar);
+  }
+
+  // ─── Public API ───────────────────────────────────────────────────────
+
+  start(): void {
+    if (this._enabled) return;
+    this._enabled        = true;
+    this._sessionClicks  = 0;
+    this._firstProbe     = true;
+    this._cdpConnected   = false;
+    this._agRunning      = false;
+    this._probeCycleCount = 0;
+    Object.keys(this._targetCounts).forEach(k => delete this._targetCounts[k]);
+    this._dedup.clear();
+    this._log('[CDP] Auto Clicker started — probing ports ' + CdpAutoClicker.PORTS.join(', '));
+    this._refreshStatusBar();
+    void this._runCycle(); // run immediately
+    this._timer = setInterval(() => void this._runCycle(), CdpAutoClicker.INJECT_MS);
+  }
+
+  stop(): void {
+    if (!this._enabled) return;
+    this._enabled = false;
+    if (this._timer) { clearInterval(this._timer); this._timer = null; }
+    this._log('[CDP] Auto Clicker stopped');
+    void this._killObservers();
+    this._refreshStatusBar();
+    this.pushCdpStatus();
+  }
+
+  toggle(): void { this._enabled ? this.stop() : this.start(); }
+
+  get isEnabled(): boolean { return this._enabled; }
+
+  setSettingsPanelRef(panel: vscode.WebviewPanel | undefined): void {
+    this._settingsPanelRef = panel;
+  }
+
+  /** Push current state to the settings panel. Called publicly so AutoContinue
+   *  can trigger it immediately when the panel first opens. */
+  pushCdpStatus(): void {
+    this._settingsPanelRef?.webview.postMessage({
+      type:          'cdpStatus',
+      enabled:       this._enabled,
+      connected:     this._cdpConnected,
+      agRunning:     this._agRunning,
+      sessionClicks: this._sessionClicks,
+    });
+  }
+
+  dispose(): void {
+    this.stop();
+    this._statusBar.dispose();
+  }
+
+  // ─── Status bar ───────────────────────────────────────────────────────
+
+  private _refreshStatusBar(): void {
+    if (!this._enabled) {
+      this._statusBar.text            = '$(mouse) AutoClick: OFF';
+      this._statusBar.tooltip         = 'CDP Auto Clicker disabled — click to open settings';
+      this._statusBar.backgroundColor = undefined;
+      return;
+    }
+    const portLabel = this._cdpConnected
+      ? 'Connected'
+      : (this._agRunning ? 'AG running — no debug port' : 'Antigravity not detected');
+    this._statusBar.text = `$(mouse) AutoClick ${this._sessionClicks}`;
+    this._statusBar.tooltip = [
+      'CDP Auto Clicker — ACTIVE',
+      `Session clicks: ${this._sessionClicks}`,
+      `Port status:    ${portLabel}`,
+      '',
+      'Antigravity must be launched with --remote-debugging-port=9333',
+      'Click to open settings',
+    ].join('\n');
+    this._statusBar.backgroundColor = this._cdpConnected
+      ? new vscode.ThemeColor('statusBarItem.warningBackground')
+      : new vscode.ThemeColor('statusBarItem.errorBackground');
+  }
+
+  // ─── Antigravity process detection ────────────────────────────────────
+  //
+  // Uses platform-native process listing to check whether Antigravity is
+  // running at all. Called every 5 cycles (~10s) to avoid slowing down
+  // the 2s injection loop with slow subprocess calls.
+
+  private async _detectAgProcess(): Promise<boolean> {
+    const run = (cmd: string) => new Promise<string>(resolve =>
+      exec(cmd, { timeout: 4000 }, (_err, stdout) => resolve(stdout || ''))
+    );
+    try {
+      if (process.platform === 'win32') {
+        const a = await run('tasklist /NH /FI "IMAGENAME eq Antigravity IDE.exe" 2>nul');
+        if (/antigravity/i.test(a)) return true;
+        const b = await run('tasklist /NH /FI "IMAGENAME eq Antigravity.exe" 2>nul');
+        return /antigravity/i.test(b);
+      } else {
+        // macOS / Linux
+        const out = await run(
+          'pgrep -f "Antigravity IDE.app/Contents/MacOS/Electron" 2>/dev/null ' +
+          '|| pgrep -f "Antigravity.app" 2>/dev/null ' +
+          '|| pgrep -f "antigravity" 2>/dev/null | head -1'
+        );
+        return out.trim().length > 0;
+      }
+    } catch { return false; }
+  }
+
+  // ─── CDP HTTP helpers ─────────────────────────────────────────────────
+
+  /** Fetch a CDP JSON endpoint. Tries 127.0.0.1 before localhost to avoid
+   *  Windows IPv6 resolution issues where localhost → ::1 but Antigravity
+   *  binds to 127.0.0.1. */
+  private _fetchCdp(port: number, path: string): Promise<unknown[]> {
+    return new Promise((resolve, reject) => {
+      const tryHost = (hosts: string[]) => {
+        if (!hosts.length) { reject(new Error('unreachable')); return; }
+        const [host, ...rest] = hosts;
+        const req = http.get(
+          `http://${host}:${port}${path}`,
+          { timeout: 3000, family: 4 } as http.RequestOptions,
+          (res) => {
+            let buf = '';
+            res.on('data', (c: string) => { buf += c; });
+            res.on('end', () => {
+              try {
+                const parsed = JSON.parse(buf.trim());
+                resolve(Array.isArray(parsed) ? parsed : []);
+              } catch { tryHost(rest); }
+            });
+          }
+        );
+        req.on('error', () => tryHost(rest));
+        req.on('timeout', () => { req.destroy(); tryHost(rest); });
+      };
+      tryHost(['127.0.0.1', 'localhost']);
+    });
+  }
+
+  private async _getTargets(port: number): Promise<unknown[]> {
+    try { return await this._fetchCdp(port, '/json/list'); } catch { /* try /json */ }
+    try { return await this._fetchCdp(port, '/json'); } catch { /* nothing */ }
+    return [];
+  }
+
+  // ─── CDP WebSocket eval ───────────────────────────────────────────────
+
+  /** Evaluate a JavaScript expression in a CDP target via WebSocket.
+   *  Resolves with the JSON-stringified return value, or null on any error.
+   *  Hard timeout of 5 seconds — suspended pages can hang indefinitely. */
+  private _wsEval(wsUrl: string, expression: string): Promise<string | null> {
+    return new Promise(resolve => {
+      // Try to use the bundled 'ws' package; fall back to the global WebSocket
+      // available in the Electron renderer context if 'ws' is not bundled.
+      let WS: any;
+      try { WS = require('ws'); } catch { WS = null; }
+      if (!WS) { try { WS = (globalThis as any).WebSocket; } catch { } }
+      if (!WS) { resolve(null); return; }
+
+      let ws: any;
+      try { ws = new WS(wsUrl); } catch { resolve(null); return; }
+
+      const done = (val: string | null) => {
+        clearTimeout(timeout);
+        try { ws.close(); } catch { }
+        resolve(val);
+      };
+
+      const timeout = setTimeout(() => done(null), 5000);
+
+      const send = () => {
+        try {
+          ws.send(JSON.stringify({
+            id: 1,
+            method: 'Runtime.evaluate',
+            params: { expression, returnByValue: true },
+          }));
+        } catch { done(null); }
+      };
+
+      const onMessage = (data: any) => {
+        try {
+          const d = JSON.parse(typeof data === 'string' ? data : data.toString());
+          done(d?.result?.result?.value ?? null);
+        } catch { done(null); }
+      };
+
+      if (typeof ws.on === 'function') {
+        // Node ws package API
+        ws.on('open',    send);
+        ws.on('message', onMessage);
+        ws.on('error',   () => done(null));
+      } else {
+        // Browser-style WebSocket API (Electron renderer)
+        ws.onopen    = send;
+        ws.onmessage = (e: any) => onMessage(e.data);
+        ws.onerror   = () => done(null);
+      }
+    });
+  }
+
+  // ─── Cross-target deduplication ───────────────────────────────────────
+  //
+  // Problem: OBSERVER_JS is injected into ALL open Antigravity webview
+  // targets. When the same button click registers in N targets, the click
+  // count delta arrives N times. We deduplicate by label within an 8s window.
+
+  private _dedupeClick(label: string): boolean {
+    const now  = Date.now();
+    const last = this._dedup.get(label) ?? 0;
+    if (now - last < CdpAutoClicker.DEDUP_MS) return false;
+    this._dedup.set(label, now);
+    // Prune old entries to prevent unbounded growth
+    if (this._dedup.size > 50) {
+      for (const [k, ts] of this._dedup) {
+        if (now - ts > CdpAutoClicker.DEDUP_MS * 3) this._dedup.delete(k);
+      }
+    }
+    return true;
+  }
+
+  // ─── Main injection cycle ─────────────────────────────────────────────
+
+  private async _runCycle(): Promise<void> {
+    if (!this._enabled) return;
+
+    // Detect whether Antigravity is running (throttled — every 5 cycles / ~10s)
+    this._probeCycleCount++;
+    if (this._probeCycleCount % 5 === 1) {
+      this._agRunning = await this._detectAgProcess();
+    }
+
+    let anyPortFound = false;
+
+    for (const port of CdpAutoClicker.PORTS) {
+      const targets = await this._getTargets(port);
+      const viable  = (targets as any[]).filter(t => t?.webSocketDebuggerUrl);
+      if (!viable.length) continue;
+
+      anyPortFound = true;
+      if (!this._cdpConnected) {
+        this._cdpConnected = true;
+        this._log(`[CDP] ✓ Connected on port ${port} — ${viable.length} target(s)`);
+        this._refreshStatusBar();
+        this.pushCdpStatus();
+      }
+
+      for (const target of viable) {
+        try {
+          const raw = await this._wsEval(target.webSocketDebuggerUrl, CdpAutoClicker.OBSERVER_JS);
+          if (!raw) continue;
+
+          let parsed: { gen: number; count: number; labels: string[] };
+          try { parsed = JSON.parse(raw); } catch { continue; }
+
+          const key   = target.webSocketDebuggerUrl;
+          const prev  = this._targetCounts[key] ?? 0;
+          const total = parsed.count ?? 0;
+
+          if (total > prev) {
+            const delta  = total - prev;
+            this._targetCounts[key] = total;
+
+            // Deduplicate across targets by label within the 8s window
+            const recentLabels = (parsed.labels ?? []).slice(-Math.min(delta, 10));
+            let effective = 0;
+            if (recentLabels.length > 0) {
+              for (const label of recentLabels) {
+                if (this._dedupeClick(label)) effective++;
+              }
+            } else if (this._dedupeClick('__unlabeled__')) {
+              effective = delta;
+            }
+
+            if (effective > 0) {
+              this._sessionClicks += effective;
+              this._log(`[CDP] 🎯 ${effective}× click in "${target.title ?? 'webview'}" (port ${port})`);
+              this._refreshStatusBar();
+              this.pushCdpStatus();
+            }
+          }
+        } catch { /* individual target failures are normal */ }
+      }
+    }
+
+    // Track first-probe completion and connection-state changes
+    if (this._firstProbe || anyPortFound !== this._cdpConnected) {
+      this._firstProbe   = false;
+      this._cdpConnected = anyPortFound;
+      this._refreshStatusBar();
+      this.pushCdpStatus();
+    }
+  }
+
+  // ─── Observer teardown ────────────────────────────────────────────────
+
+  /** Inject KILL_JS into all reachable targets — stops all running observers. */
+  private async _killObservers(): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) await new Promise(r => setTimeout(r, 500));
+      for (const port of CdpAutoClicker.PORTS) {
+        const targets = await this._getTargets(port);
+        for (const t of targets as any[]) {
+          if (!t?.webSocketDebuggerUrl) continue;
+          try { await this._wsEval(t.webSocketDebuggerUrl, CdpAutoClicker.KILL_JS); } catch { }
+        }
+      }
+    }
+    this._log('[CDP] Kill script sent to all targets');
+  }
+}
+
 // ─── Extension Lifecycle ───────────────────────────────────────────────────
 
 let autoContinue: AutoContinue | undefined;
@@ -2031,6 +3066,9 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('helmAutoContinue.stop', () => autoContinue?.stop()),
     vscode.commands.registerCommand('helmAutoContinue.showLog', () => autoContinue?.showLog()),
     vscode.commands.registerCommand('helmAutoContinue.reportError', () => autoContinue?.reportError()),
+    vscode.commands.registerCommand('helmAutoContinue.simulateError', () => autoContinue?.simulateError()),
+    vscode.commands.registerCommand('helmAutoContinue.markWindowActive', () => autoContinue?.markWindowActive()),
+    vscode.commands.registerCommand('helmAutoContinue.runFullTest', () => autoContinue?.runFullTest()),
     vscode.commands.registerCommand('helmAutoContinue.openSettings', () => autoContinue?.openSettings()),
   );
 }
