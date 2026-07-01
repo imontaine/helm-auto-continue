@@ -2,7 +2,7 @@
   "name": "helm-auto-continue",
   "displayName": "Antigravity Recovery Auto Continue",
   "description": "Automatically detects chat API errors (503, rate limits, capacity exhaustion) and sends 'Continue' to resume the AI agent.",
-  "version": "1.34.2",
+  "version": "1.34.3",
   "license": "MIT",
   "publisher": "imontaine",
   "icon": "media/icon-120.png",
@@ -61,15 +61,33 @@
     ],
     "menus": {
       "commandPalette": [
-        { "command": "helmAutoContinue.toggle" },
-        { "command": "helmAutoContinue.start" },
-        { "command": "helmAutoContinue.stop" },
-        { "command": "helmAutoContinue.showLog" },
-        { "command": "helmAutoContinue.reportError" },
-        { "command": "helmAutoContinue.openSettings" },
-        { "command": "helmAutoContinue.simulateError" },
-        { "command": "helmAutoContinue.markWindowActive" },
-        { "command": "helmAutoContinue.runFullTest" }
+        {
+          "command": "helmAutoContinue.toggle"
+        },
+        {
+          "command": "helmAutoContinue.start"
+        },
+        {
+          "command": "helmAutoContinue.stop"
+        },
+        {
+          "command": "helmAutoContinue.showLog"
+        },
+        {
+          "command": "helmAutoContinue.reportError"
+        },
+        {
+          "command": "helmAutoContinue.openSettings"
+        },
+        {
+          "command": "helmAutoContinue.simulateError"
+        },
+        {
+          "command": "helmAutoContinue.markWindowActive"
+        },
+        {
+          "command": "helmAutoContinue.runFullTest"
+        }
       ]
     },
     "configuration": {
@@ -118,7 +136,11 @@
         "helmAutoContinue.logLevel": {
           "type": "string",
           "default": "minimal",
-          "enum": ["minimal", "normal", "verbose"],
+          "enum": [
+            "minimal",
+            "normal",
+            "verbose"
+          ],
           "enumDescriptions": [
             "Events only — errors, recoveries, continues. Zero output on quiet polls.",
             "State changes, startup info, and dispatch method. Silent during healthy polls.",
@@ -139,7 +161,9 @@
         },
         "helmAutoContinue.errorPatterns": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "default": [
             "\\b503\\b",
             "rate.?limit",
@@ -164,7 +188,9 @@
         },
         "helmAutoContinue.suppressPatterns": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "default": [
             "insufficient.?ai.?credits",
             "insufficient.?credits",
@@ -192,7 +218,11 @@
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.18.1",
     "esbuild": "^0.20.0",
     "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "ws": "^8.21.0"
   }
 }

@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as http from 'http';
 import { exec } from 'child_process';
+import WebSocket from 'ws';
 
 /**
  * AutoContinue: a toggleable timer that monitors for chat API errors
@@ -2892,16 +2893,9 @@ class CdpAutoClicker {
    *  Resolves with the JSON-stringified return value, or null on any error.
    *  Hard timeout of 5 seconds — suspended pages can hang indefinitely. */
   private _wsEval(wsUrl: string, expression: string): Promise<string | null> {
-    return new Promise(resolve => {
-      // Try to use the bundled 'ws' package; fall back to the global WebSocket
-      // available in the Electron renderer context if 'ws' is not bundled.
-      let WS: any;
-      try { WS = require('ws'); } catch { WS = null; }
-      if (!WS) { try { WS = (globalThis as any).WebSocket; } catch { } }
-      if (!WS) { resolve(null); return; }
-
-      let ws: any;
-      try { ws = new WS(wsUrl); } catch { resolve(null); return; }
+    return new Promise((resolve) => {
+      let ws: WebSocket;
+      try { ws = new WebSocket(wsUrl); } catch { resolve(null); return; }
 
       const done = (val: string | null) => {
         clearTimeout(timeout);
@@ -2911,7 +2905,7 @@ class CdpAutoClicker {
 
       const timeout = setTimeout(() => done(null), 5000);
 
-      const send = () => {
+      ws.on('open', () => {
         try {
           ws.send(JSON.stringify({
             id: 1,
@@ -2919,26 +2913,16 @@ class CdpAutoClicker {
             params: { expression, returnByValue: true },
           }));
         } catch { done(null); }
-      };
+      });
 
-      const onMessage = (data: any) => {
+      ws.on('message', (data: Buffer | string) => {
         try {
           const d = JSON.parse(typeof data === 'string' ? data : data.toString());
           done(d?.result?.result?.value ?? null);
         } catch { done(null); }
-      };
+      });
 
-      if (typeof ws.on === 'function') {
-        // Node ws package API
-        ws.on('open',    send);
-        ws.on('message', onMessage);
-        ws.on('error',   () => done(null));
-      } else {
-        // Browser-style WebSocket API (Electron renderer)
-        ws.onopen    = send;
-        ws.onmessage = (e: any) => onMessage(e.data);
-        ws.onerror   = () => done(null);
-      }
+      ws.on('error', () => done(null));
     });
   }
 

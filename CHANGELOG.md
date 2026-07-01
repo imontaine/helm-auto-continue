@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.34.3
+
+### Bug Fix — CDP Auto Clicker never actually clicked anything
+
+- **`ws` WebSocket package is now bundled** — The `_wsEval` method previously
+  used `try { require('ws') } catch { ... }` to load the WebSocket library at
+  runtime. This always fails in a bundled VS Code extension because esbuild's
+  module resolution replaces `require()` at build time. Since `ws` was not in
+  `node_modules`, the require threw and the fallback `globalThis.WebSocket`
+  also didn't exist in the Node.js extension host, so `_wsEval` always
+  resolved `null` — meaning OBSERVER_JS was never injected and no buttons
+  were ever clicked.
+
+  Fixed by: `npm install ws`, adding `import WebSocket from 'ws'` at the top
+  of `extension.ts`, and rewriting `_wsEval` to use the typed static import
+  directly. esbuild now bundles `ws` into `dist/extension.js` (bundle size
+  67 KB → 143 KB production). The `require('ws')` fallback path is removed.
+
 ## v1.34.2
 
 ### Bug Fix — CDP Auto Clicker toggle appears to do nothing
