@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.34.1
+
+### Bug Fix — CDP Auto Clicker toggle
+
+- **CDP toggle now works correctly** — The settings page catch-all toggle
+  handler (`.toggle input:not(#monitorToggle)`) also matched `#cdpToggle`,
+  causing it to send a redundant `updateSetting` message with the wrong key
+  (`cdpToggle` instead of `cdpAutoClick`) alongside the correct `toggleCdp`
+  message. This made the toggle appear to do nothing because VS Code could not
+  find `helmAutoContinue.cdpToggle` in the schema. Fixed by excluding
+  `#cdpToggle` from the catch-all selector
+  (`.toggle input:not(#monitorToggle):not(#cdpToggle)`).
+
 ## v1.34.0
 
 ### New Feature — CDP Auto Clicker

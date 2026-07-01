@@ -2335,8 +2335,8 @@ class AutoContinue {
       });
     });
 
-    // Toggles (settings only — exclude monitor toggle)
-    document.querySelectorAll('.toggle input:not(#monitorToggle)').forEach(el => {
+    // Toggles (settings only — exclude monitor and CDP toggles which have their own handlers)
+    document.querySelectorAll('.toggle input:not(#monitorToggle):not(#cdpToggle)').forEach(el => {
       el.addEventListener('change', () => {
         save(el.id, el.checked);
       });
