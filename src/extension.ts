@@ -2750,12 +2750,13 @@ class CdpAutoClicker {
     this._firstProbe     = true;
     this._cdpConnected   = false;
     this._agRunning      = false;
-    this._probeCycleCount = 0;
+    this._probeCycleCount = 1; // start at 1 so first cycle (1→2) skips slow _detectAgProcess()
     Object.keys(this._targetCounts).forEach(k => delete this._targetCounts[k]);
     this._dedup.clear();
     this._log('[CDP] Auto Clicker started — probing ports ' + CdpAutoClicker.PORTS.join(', '));
     this._refreshStatusBar();
-    void this._runCycle(); // run immediately
+    this.pushCdpStatus();   // ← immediate feedback so toggle reflects ON right away
+    void this._runCycle();  // probe ports now; will push another update when done
     this._timer = setInterval(() => void this._runCycle(), CdpAutoClicker.INJECT_MS);
   }
 

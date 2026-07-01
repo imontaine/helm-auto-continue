@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.34.2
+
+### Bug Fix — CDP Auto Clicker toggle appears to do nothing
+
+- **Toggle now responds instantly** — `start()` now calls `pushCdpStatus()`
+  immediately after setting `_enabled = true`, so the settings panel receives
+  `{ enabled: true }` right away and the toggle snaps to ON without waiting for
+  the first port-probe cycle to complete.
+
+- **First cycle no longer blocks on process detection** — `_probeCycleCount`
+  now initialises to `1` instead of `0`, so `1 % 5 === 1` is not true on the
+  very first cycle. The slow `_detectAgProcess()` subprocess (`tasklist`, up to
+  4 s on Windows) is skipped on the first cycle and fires naturally on cycle 5
+  (~10 s after start). Previously, the toggle appeared dead because the very
+  first `pushCdpStatus({ enabled: true })` was blocked behind this subprocess
+  call.
+
 ## v1.34.1
 
 ### Bug Fix — CDP Auto Clicker toggle
